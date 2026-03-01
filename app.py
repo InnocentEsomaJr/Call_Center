@@ -1113,11 +1113,20 @@ def render_general_page(filtered: pd.DataFrame) -> None:
             .sort_values("record_count", ascending=False)
             .rename(columns={"province": "Province", "territoire": "Territoire", "details": "Details de l'appel", "record_count": "Record Count"})
         )
-        st.dataframe(
-            details.head(400).style.background_gradient(subset=["Record Count"], cmap="Reds"),
-            use_container_width=True,
-            height=470,
-        )
+        details_preview = details.head(400)
+        try:
+            st.dataframe(
+                details_preview.style.background_gradient(subset=["Record Count"], cmap="Reds"),
+                use_container_width=True,
+                height=470,
+            )
+        except Exception:
+            # Streamlit Cloud may not have matplotlib; fallback to a plain dataframe.
+            st.dataframe(
+                details_preview,
+                use_container_width=True,
+                height=470,
+            )
 
     with right_col:
         c1, c2 = st.columns(2)
