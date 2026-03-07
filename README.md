@@ -1,16 +1,27 @@
-# Dashboard Call Center (Python / Streamlit)
+# Dashboard Call Center (Streamlit + PostgreSQL)
 
-Tableau de bord interactif de gestion des appels et alertes, alimente par des fichiers Excel importes manuellement.
+Tableau de bord interactif pour le suivi des appels et alertes.
 
-## 1) Objectif du projet
+Le projet supporte maintenant 2 modes:
+- `PostgreSQL` (recommande): les donnees sont lues depuis la base SQL.
+- `Upload Excel direct`: lecture temporaire des fichiers uploades dans la session.
 
-Ce dashboard permet de:
+## 1) Fonctions principales
 
-- centraliser les donnees d'appels et d'alertes
-- filtrer rapidement par periode, province, genre, incident et categorie
-- suivre les indicateurs cles (KPI)
-- analyser la repartition des appels et alertes
-- visualiser la geolocalisation des appels par province
+- KPI dynamiques: Province, Tot appels, Resolu, Non resolu, Hommes, Femmes, ND
+- Filtres globaux: periode, province, genre, incident/pathologie, categorie d'appel
+- Pages:
+  - `Informations generales`
+  - `Autres details d'informations`
+  - `Details alertes`
+- Graphiques interactifs avec valeurs affichees
+- Basculement automatique des graphiques province -> territoires si une seule province est selectionnee
+- Carte geolocalisee des appels par province (RDC)
+- Analyses avancees:
+  - completude des champs
+  - performance de resolution
+  - comparaison avec periode precedente
+  - profil des appels
 
 ## 2) Installation
 
@@ -27,135 +38,190 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## 4) Etats de l'application (important)
+## 4) Mode PostgreSQL
 
-Le dashboard fonctionne par etats clairs:
+Dans la barre laterale:
+1. Choisir `Source des donnees -> PostgreSQL`
+2. Renseigner:
+   - Host
+   - Port
+   - Base
+   - Utilisateur
+   - Mot de passe
+   - Schema
+3. Cliquer `Tester la connexion`
 
-1. Etat "Attente d'import"
-- Aucun fichier n'est charge par defaut.
-- L'utilisateur doit importer les fichiers depuis la barre laterale.
-- Un message d'information s'affiche tant que les 2 types de fichiers ne sont pas presents.
+L'application cree automatiquement les tables si elles n'existent pas:
+- `public.call_center_calls`
+- `public.call_center_alerts`
 
-2. Etat "Donnees chargees"
-- Le tableau de bord s'active apres import d'au moins un fichier APPELS et un fichier ALERTES.
-- Le bandeau KPI horizontal apparait sous le titre.
-- Les filtres principaux deviennent operationnels.
+Si la base cible (ex: `call_center`) n'existe pas encore, l'application tente de la creer automatiquement.
 
-3. Etat "Filtres appliques"
-- Toute selection met a jour les KPI, tableaux, graphiques et carte.
-- Si un filtre ne retourne rien, un message explicite s'affiche.
-- Les analyses avancees (completude, resolution, comparaison periode precedente, profil horaire) se recalculent automatiquement.
+Vous pouvez aussi creer le schema manuellement avec:
+- `sql/schema_call_center.sql`
 
-4. Etat "Resultat vide"
-- Si une vue n'a pas de donnees (ex: tendance vide), une alerte visuelle remplace le graphique.
+## 5) Import Excel vers PostgreSQL
 
-## 5) Import des fichiers (options)
+Toujours depuis la barre laterale:
+1. Ouvrir `Importer Excel vers PostgreSQL`
+2. Choisir le mode:
+   - `append`: ajoute les nouvelles lignes
+   - `replace`: remplace les lignes de la table cible
+3. Uploader un ou plusieurs fichiers:
+   - APPELS (`.xls`, `.xlsx`)
+   - ALERTES (`.xls`, `.xlsx`)
+4. Cliquer `Importer vers PostgreSQL`
 
-Le module d'import accepte maintenant plusieurs fichiers.
+Les fichiers sont standardises automatiquement avant ecriture SQL.
 
-- APPELS: import multiple (`.xls`, `.xlsx`)
-- ALERTES: import multiple (`.xls`, `.xlsx`)
-- Les fichiers importes sont fusionnes automatiquement (concat)
+Nouveautes import:
+- anti-doublons par `file_hash` (meme contenu) + controle nom/periode
+- rejet si la colonne `date` est absente/non reconnue
+- detection des colonnes manquantes
+- detection des lignes incompletes
+- rapport d'import detaille (lignes lues, inserees, doublons, statut, message)
 
-Regles:
+## 6) Variables d'environnement (optionnel, recommande)
 
-- pas de lecture automatique depuis disque
-- pas de mode demo automatique
-- import obligatoire depuis l'interface
+Vous pouvez pre-remplir la connexion:
 
-## 6) Filtres disponibles
+```bash
+setx PGHOST "localhost"
+setx PGPORT "5432"
+setx PGDATABASE "call_center"
+setx PGUSER "postgres"
+setx PGPASSWORD "votre_mot_de_passe"
+setx PGSCHEMA "public"
+setx PGSSLMODE "prefer"
+```
 
-Filtres principaux:
+Puis redemarrer le terminal.
 
-- Selectionner la periode
-- Province
-- Genre
-- Incident/Pathologie
-- Categorie d'appel
+## 7) Structure SQL utilisee
 
-Filtres page alertes:
+### Table `call_center_calls`
+- `date` (timestamp)
+- `province` (text)
+- `territoire` (text)
+- `details` (text)
+- `incident` (text)
+- `categorie` (text)
+- `genre` (text)
+- `statut` (text)
+- `record_count` (double precision)
+- `source_file` (text)
+- `sheet_name` (text)
+- `imported_at` (timestamptz)
 
-- Localite
-- Indicateur
+### Table `call_center_alerts`
+- `date` (timestamp)
+- `location` (text)
+- `indicator` (text)
+- `value` (double precision)
+- `details` (text)
+- `source_file` (text)
+- `sheet_name` (text)
+- `imported_at` (timestamptz)
 
-## 7) Sections du dashboard (navigation)
+### Table `import_audit`
+- `dataset_type`, `file_name`, `file_hash`
+- `date_min`, `date_max`
+- `total_rows`, `rows_inserted`, `duplicate_rows`
+- `missing_columns`, `missing_rows`
+- `status`, `message`, `imported_at`
 
-1. `Informations generales`
-- KPI verticaux (panneau complet)
-- tableau des details d'appel (nature/type)
-- proportion d'appel par province (barres)
-- geolocalisation des appels (carte agrandie)
-- evolution quotidienne des appels
-- analyses avancees interactives par filtres
+## 8) Dictionnaire de donnees
 
-2. `Autres details d'informations`
-- repartition par genre (donut)
-- repartition par incident (barres)
-- categories des appels (barres)
-- evolution du volume d'appels
+Nouveau fichier:
+- `data_dictionary.py`
 
-3. `Details alertes`
-- filtres alertes
-- indicateurs globaux alertes
-- alertes par localite
-- alertes par indicateur
-- evolution des alertes
-- tableau detail des alertes
+Contenu:
+- normalisation province/territoire (referentiel RDC base sur la liste fournie)
+- mapping territoire -> province
+- dictionnaire de pathologies (alias -> libelle canonique)
 
-## 8) Definition des KPI
+## 9) Etats de l'application
 
-Le dashboard calcule les indicateurs suivants:
+1. `PostgreSQL vide`:
+- message de guidage pour importer les Excel
 
-- `Province`: nombre de provinces distinctes dans le jeu filtre
-- `Tot appels`: somme de `record_count`
-- `Resolu`: volume des appels avec statut resolu
-- `Non resolu`: `Tot appels - Resolu`
-- `Hommes`: volume des appels genre homme
-- `Femmes`: volume des appels genre femme
-- `ND`: volume des appels genre non defini
+2. `Donnees chargees`:
+- KPI, filtres et graphiques actifs
 
-## 9) Structure des donnees attendue (mapping souple)
+3. `Filtres appliques`:
+- toutes les vues se recalculent dynamiquement
 
-Le mapping des colonnes est automatique avec alias.
+4. `Resultat vide`:
+- message explicite en remplacement du graphique
 
-Exemples reconnus pour APPELS:
+## 10) Depannage rapide
 
-- Date: `date`, `periode`, `period`
-- Heure: `heure`, `hour`
-- Province: `province`
-- Territoire: `territoire`, `zone`, `district`
-- Details appel: `details`, `nature`, `description`, `details de l'appel`
-- Incident/pathologie: `incident`, `pathologie`, `type`
-- Categorie: `categorie`, `category`
-- Genre: `genre`, `sexe`
-- Statut: `statut`, `status`, `resolution`
-- Compte: `record count`, `count`, `nombre`, `value`
+Probleme: connexion PostgreSQL refusee
+- verifier host/port/user/password/base
+- verifier que le service PostgreSQL tourne
 
-Exemples reconnus pour ALERTES:
+Probleme: carte vide
+- les provinces doivent correspondre au referentiel RDC (alias inclus)
 
-- Date: `date`, `periode`, `mois`
-- Heure: `heure`, `hour`
-- Localite: `province`, `organisation unit`, `territoire`
-- Indicateur: `indicateur`, `data`, `type`, `categorie`
-- Valeur: `value`, `count`, `nombre`
+Probleme: table vide apres import
+- verifier les colonnes Excel (mapping automatique base sur alias)
+- verifier les erreurs affichees dans le panneau d'import
 
-## 10) Regles techniques utiles
+Probleme: dashboard ne montre rien
+- verifier qu'il y a des donnees APPELS pour la periode filtree
 
-- Les dates Excel numeriques (ex: `46077`) sont converties automatiquement.
-- Les heures fractionnaires Excel sont converties en horaire.
-- Les agregations temporelles sont stabilisees par jour pour eviter les erreurs de version pandas.
-- La geolocalisation est basee sur un referentiel de coordonnees de provinces RDC.
+## 11) Mode admin import (lecture seule pour les autres)
 
-## 11) Depannage rapide
+Le panneau `Importer Excel vers PostgreSQL` peut etre verrouille par mot de passe admin.
 
-Probleme: "Importez au moins un fichier APPELS et un fichier ALERTES"
-- Cause: un des deux types de fichier manque.
-- Action: importer au moins un fichier de chaque type dans la barre laterale.
+Configurer dans les secrets/env:
+- `ADMIN_IMPORT_PASSWORD`
 
-Probleme: pas de carte geolocalisation
-- Cause: noms de province non reconnus dans le referentiel.
-- Action: harmoniser les noms de province dans Excel.
+Exemple local Windows:
 
-Probleme: graphiques vides
-- Cause: filtres trop restrictifs ou periode hors donnees.
-- Action: reinitialiser les filtres et verifier les dates importees.
+```bash
+setx ADMIN_IMPORT_PASSWORD "MonCodeAdminFort"
+```
+
+Effet:
+- si `ADMIN_IMPORT_PASSWORD` est defini: import bloque tant que le code admin n'est pas saisi
+- si non defini: import ouvert pour tous
+
+## 12) Deploiement Streamlit Cloud + PostgreSQL
+
+### Cas recommande (production)
+
+Utiliser une base PostgreSQL hebergee en ligne (Neon, Supabase, Render, RDS...).
+
+1. Creer la base distante
+2. Executer `sql/schema_call_center.sql`
+3. Configurer les secrets Streamlit:
+   - `PGHOST`
+   - `PGPORT`
+   - `PGDATABASE`
+   - `PGUSER`
+   - `PGPASSWORD`
+   - `PGSCHEMA`
+   - `PGSSLMODE` (`require` souvent recommande)
+   - `ADMIN_IMPORT_PASSWORD` (optionnel mais recommande)
+4. Deployer l'app sur Streamlit Cloud
+
+### Utiliser ta base locale de ton PC (possible, mais fragile)
+
+Ce n'est pas direct avec `localhost`. Streamlit Cloud doit atteindre une adresse publique.
+
+Conditions obligatoires:
+- ton PC reste allume 24/7
+- Postgres ecoute sur une interface reseau (pas seulement localhost)
+- ouverture/forward du port 5432 (ou tunnel TCP securise)
+- firewall + `pg_hba.conf` configures pour autoriser uniquement l'IP/tunnel voulu
+- TLS recommande
+
+En pratique:
+1. Exposer ton Postgres via IP publique + routeur (ou tunnel type Cloudflare Tunnel/Tailscale/ngrok TCP)
+2. Tester depuis un reseau externe
+3. Mettre cette adresse publique dans les secrets Streamlit
+
+Attention securite:
+- ne jamais exposer Postgres publiquement sans restriction IP + mot de passe fort + SSL
+- pour un usage multi-utilisateurs, une base cloud geree reste nettement plus sure et stable
