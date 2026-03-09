@@ -1,6 +1,6 @@
 CREATE SCHEMA IF NOT EXISTS public;
 
-CREATE TABLE IF NOT EXISTS public.call_center_calls (
+CREATE TABLE IF NOT EXISTS public.call_center_records (
     id BIGSERIAL PRIMARY KEY,
     date TIMESTAMP,
     province TEXT,
@@ -13,19 +13,7 @@ CREATE TABLE IF NOT EXISTS public.call_center_calls (
     record_count DOUBLE PRECISION,
     source_file TEXT,
     sheet_name TEXT,
-    row_hash TEXT,
-    imported_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS public.call_center_alerts (
-    id BIGSERIAL PRIMARY KEY,
-    date TIMESTAMP,
-    location TEXT,
-    indicator TEXT,
-    value DOUBLE PRECISION,
-    details TEXT,
-    source_file TEXT,
-    sheet_name TEXT,
+    source_kind TEXT,
     row_hash TEXT,
     imported_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -49,11 +37,22 @@ CREATE TABLE IF NOT EXISTS public.import_audit (
     message TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_call_center_calls_date ON public.call_center_calls(date);
-CREATE INDEX IF NOT EXISTS idx_call_center_calls_province ON public.call_center_calls(province);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_call_center_calls_row_hash ON public.call_center_calls(row_hash);
-CREATE INDEX IF NOT EXISTS idx_call_center_alerts_date ON public.call_center_alerts(date);
-CREATE INDEX IF NOT EXISTS idx_call_center_alerts_location ON public.call_center_alerts(location);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_call_center_alerts_row_hash ON public.call_center_alerts(row_hash);
+CREATE TABLE IF NOT EXISTS public.dashboard_users (
+    id BIGSERIAL PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('administrateur', 'utilisateur')),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    full_name TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_center_records_date ON public.call_center_records(date);
+CREATE INDEX IF NOT EXISTS idx_call_center_records_province ON public.call_center_records(province);
+CREATE INDEX IF NOT EXISTS idx_call_center_records_source_kind ON public.call_center_records(source_kind);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_call_center_records_row_hash ON public.call_center_records(row_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_import_audit_dataset_file_hash ON public.import_audit(dataset_type, file_hash);
 CREATE INDEX IF NOT EXISTS idx_import_audit_dataset_file_period ON public.import_audit(dataset_type, file_name_norm, date_min, date_max);
+CREATE INDEX IF NOT EXISTS idx_dashboard_users_role ON public.dashboard_users(role);
+CREATE INDEX IF NOT EXISTS idx_dashboard_users_active ON public.dashboard_users(is_active);

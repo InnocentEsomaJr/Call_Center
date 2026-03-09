@@ -52,8 +52,7 @@ Dans la barre laterale:
 3. Cliquer `Tester la connexion`
 
 L'application cree automatiquement les tables si elles n'existent pas:
-- `public.call_center_calls`
-- `public.call_center_alerts`
+- `public.call_center_records`
 
 Si la base cible (ex: `call_center`) n'existe pas encore, l'application tente de la creer automatiquement.
 
@@ -67,9 +66,8 @@ Toujours depuis la barre laterale:
 2. Choisir le mode:
    - `append`: ajoute les nouvelles lignes
    - `replace`: remplace les lignes de la table cible
-3. Uploader un ou plusieurs fichiers:
-   - APPELS (`.xls`, `.xlsx`)
-   - ALERTES (`.xls`, `.xlsx`)
+3. Uploader un ou plusieurs fichiers Excel (`.xls`, `.xlsx`) dans un seul champ.
+   - Le type (appels/alertes) est detecte automatiquement.
 4. Cliquer `Importer vers PostgreSQL`
 
 Les fichiers sont standardises automatiquement avant ecriture SQL.
@@ -99,7 +97,7 @@ Puis redemarrer le terminal.
 
 ## 7) Structure SQL utilisee
 
-### Table `call_center_calls`
+### Table `call_center_records`
 - `date` (timestamp)
 - `province` (text)
 - `territoire` (text)
@@ -111,16 +109,7 @@ Puis redemarrer le terminal.
 - `record_count` (double precision)
 - `source_file` (text)
 - `sheet_name` (text)
-- `imported_at` (timestamptz)
-
-### Table `call_center_alerts`
-- `date` (timestamp)
-- `location` (text)
-- `indicator` (text)
-- `value` (double precision)
-- `details` (text)
-- `source_file` (text)
-- `sheet_name` (text)
+- `source_kind` (text: `calls` / `alerts`)
 - `imported_at` (timestamptz)
 
 ### Table `import_audit`
@@ -168,7 +157,7 @@ Probleme: table vide apres import
 - verifier les erreurs affichees dans le panneau d'import
 
 Probleme: dashboard ne montre rien
-- verifier qu'il y a des donnees APPELS pour la periode filtree
+- verifier qu'il y a des donnees importees pour la periode filtree
 
 ## 11) Mode admin import (lecture seule pour les autres)
 
@@ -187,7 +176,101 @@ Effet:
 - si `ADMIN_IMPORT_PASSWORD` est defini: import bloque tant que le code admin n'est pas saisi
 - si non defini: import ouvert pour tous
 
-## 12) Deploiement Streamlit Cloud + PostgreSQL
+## 12) Gestion des utilisateurs (admin / utilisateur)
+
+L'application integre maintenant une connexion en barre laterale avec 2 roles:
+- `administrateur`: acces complet (configuration PostgreSQL, import Excel -> PostgreSQL, tous les boutons)
+- `utilisateur`: lecture seule (visualisation sections + export Excel final)
+
+### Source des comptes (priorite)
+
+1. PostgreSQL: table `public.dashboard_users` (source principale)
+2. Secrets/env (fallback)
+3. Fallback dev (`admin/admin`, `user/user`) si rien n'est configure
+
+La table `dashboard_users` est creee automatiquement et peut etre administree dans:
+- barre laterale -> `Gestion utilisateurs dashboard` (profil administrateur)
+
+Mode d'authentification:
+- `DASHBOARD_AUTH_SOURCE=postgres` (defaut, recommande)
+- `DASHBOARD_AUTH_SOURCE=auto` (autorise fallback secrets/env si PostgreSQL indisponible)
+
+### Configuration initiale recommandee (seeding)
+
+```bash
+setx DASHBOARD_ADMIN_USERNAME "admin_cc"
+setx DASHBOARD_ADMIN_PASSWORD "MotDePasseAdminFort"
+setx DASHBOARD_USER_USERNAME "user_cc"
+setx DASHBOARD_USER_PASSWORD "MotDePasseUserFort"
+```
+
+Ces comptes servent de seed initial si la table `dashboard_users` est vide.
+
+Option fallback (avancee) avec JSON:
+
+```bash
+setx DASHBOARD_USERS_JSON "[{\"username\":\"admin_cc\",\"password\":\"MotDePasseAdminFort\",\"role\":\"administrateur\"},{\"username\":\"user_cc\",\"password\":\"MotDePasseUserFort\",\"role\":\"utilisateur\"}]"
+```
+
+Vous pouvez aussi stocker les mots de passe en SHA-256:
+- format: `sha256:<hexdigest>`
+
+Important:
+- En production, remplacez les comptes par defaut et utilisez des mots de passe forts.
+- Vous pouvez stocker un hash au format `sha256:<hexdigest>`.
+
+## 13) Export PostgreSQL -> DHIS2 (serveur dev)
+
+Nouveau script: `dhis2_export.py`
+
+Objectif:
+- lire PostgreSQL (table unique `call_center_records`)
+- calculer:
+  - total alertes
+  - total appels
+  - resolu / non resolu
+  - repartition par sexe
+  - repartition par categorie
+  - repartition par pathologie
+- pousser vers DHIS2 via `/api/dataValueSets`
+
+### Variables obligatoires DHIS2
+
+```bash
+setx DHIS2_URL "https://<votre-serveur-dhis2>"
+setx DHIS2_USERNAME "admin"
+setx DHIS2_PASSWORD "district"
+setx DHIS2_ORG_UNIT_UID "<UID_ORGUNIT>"
+```
+
+### UIDs data elements (minimaux)
+
+```bash
+setx DHIS2_DE_ALERTES_TOTAL "<UID>"
+setx DHIS2_DE_APPELS_TOTAL "<UID>"
+setx DHIS2_DE_RESOLU "<UID>"
+setx DHIS2_DE_NON_RESOLU "<UID>"
+setx DHIS2_DE_HOMMES "<UID>"
+setx DHIS2_DE_FEMMES "<UID>"
+setx DHIS2_DE_ND "<UID>"
+```
+
+### Mappings categories/pathologies (optionnels mais recommandes)
+
+```bash
+setx DHIS2_CATEGORY_DATAELEMENT_MAP "{\"Alerte\":\"<UID>\",\"Questions/Preoccupations\":\"<UID>\"}"
+setx DHIS2_PATHOLOGY_DATAELEMENT_MAP "{\"Cholera\":\"<UID>\",\"MonkeyPox\":\"<UID>\"}"
+```
+
+### Execution
+
+```bash
+python dhis2_export.py --start-date 2026-02-18 --end-date 2026-02-25 --period 20260225
+```
+
+`--period` doit correspondre au format de period DHIS2 de votre configuration (jour/mois).
+
+## 14) Deploiement Streamlit Cloud + PostgreSQL
 
 ### Cas recommande (production)
 
