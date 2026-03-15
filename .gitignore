@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+pg_config.local.json
+pg_config.local.example.json
+*.log

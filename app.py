@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote_plus
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -29,6 +28,9 @@ st.set_page_config(page_title="Dashboard Call Center", layout="wide", initial_si
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+LOCAL_PG_CONFIG_PATH = BASE_DIR / "pg_config.local.json"
+AUTH_SESSION_PATH = DATA_DIR / ".auth_session.json"
+AUTH_SESSION_DAYS = 7
 PICTURES_CALL_CENTER_DIR = Path.home() / "Pictures" / "Call Center"
 DEFAULT_APPELS_FILENAME = "APPELS COUSP DU 24 FEVRIER 2026.xlsx"
 DEFAULT_ALERTES_FILENAME = "ALERTE COUSP DU 25 FEVRIER 2026.xlsx"
@@ -39,6 +41,8 @@ DEFAULT_DB_PORT = "5432"
 DEFAULT_DB_NAME = "call_center"
 DEFAULT_DB_USER = "postgres"
 DEFAULT_DB_SCHEMA = "public"
+MAX_TABLE_ROWS = 1000
+MAX_LABEL_POINTS = 250
 
 THEME = {
     "teal": "#005f73",
@@ -163,14 +167,41 @@ MONTH_NAMES_FR = {
 
 CALL_COLUMN_ALIASES = {
     "date": ["date", "periode", "period", "jour", "timestamp"],
-    "heure": ["heure", "hour"],
+    "heure": ["heure", "hour", "time"],
+    "numero": ["numero", "num", "telephone", "tel", "phone", "appelant", "caller", "numero appel", "numero appelant"],
+    "nom": ["nom", "lastname", "surname", "postnom", "nom appelant"],
+    "prenom": ["prenom", "prénom", "firstname", "given name", "prenom appelant"],
     "province": ["province", "prov"],
     "territoire": ["territoire", "territory", "zone", "district", "ville", "commune"],
-    "details": ["details", "detail", "description", "nature", "message", "motif", "sujet", "appel"],
-    "incident": ["incident", "pathologie", "maladie", "patho", "type"],
-    "categorie": ["categorie", "category", "type demande", "type appel", "classification"],
+    "details": [
+        "details",
+        "detail",
+        "details appel",
+        "details de l'appel",
+        "detail de l'appel",
+        "details_appel",
+        "description",
+        "nature",
+        "message",
+        "motif",
+        "sujet",
+        "appel",
+    ],
+    "incident": [
+        "incident",
+        "pathologie",
+        "maladie",
+        "patho",
+        "type",
+        "type/pathologie",
+        "type pathologie",
+        "type_pathologie",
+    ],
+    "categorie": ["categorie", "catégorie", "category", "type demande", "type appel", "classification"],
     "genre": ["genre", "sexe", "gender", "sex"],
-    "statut": ["statut", "status", "resolution", "resolu", "conclusion", "etat"],
+    "item": ["item", "objet", "article", "theme", "topic"],
+    "statut": ["statut", "status", "resolu", "conclusion", "etat"],
+    "resolution": ["resolution", "résolution", "solution", "traitement", "orientation"],
     "record_count": ["record count", "count", "nombre", "nb", "qty", "quantite", "valeur", "value"],
 }
 
@@ -209,6 +240,160 @@ def get_secret_or_env(key: str, default: str = "") -> str:
     except Exception:
         pass
     return str(os.getenv(key, default))
+
+
+def load_local_pg_config() -> dict[str, str]:
+    """Lit un fichier local pg_config.local.json (ignore par git) pour la connexion PostgreSQL."""
+    if not LOCAL_PG_CONFIG_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(LOCAL_PG_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    allowed = {"host", "port", "database", "user", "password", "schema", "sslmode"}
+    cleaned: dict[str, str] = {}
+    for key in allowed:
+        if key in raw and str(raw[key]).strip():
+            cleaned[key] = str(raw[key]).strip()
+    return cleaned
+
+
+def build_upload_signature(uploaded_files: list[object] | None) -> str:
+    """Empreinte legere des fichiers uploades (nom + taille) pour le cache local."""
+    files = [f for f in (uploaded_files or []) if f is not None]
+    if not files:
+        return ""
+    parts: list[str] = []
+    for file_obj in files:
+        size = getattr(file_obj, "size", None)
+        parts.append(f"{file_obj.name}:{size}")
+    return "|".join(parts)
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def check_postgres_connection_cached(
+    host: str,
+    port: str,
+    database: str,
+    user: str,
+    password: str,
+    schema: str,
+    sslmode: str,
+) -> tuple[bool, str]:
+    """Cache court pour eviter de retester la connexion a chaque interaction UI."""
+    cfg = PostgresConfig(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+        schema=schema,
+        sslmode=sslmode,
+    )
+    return ensure_postgres_database(cfg)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def ensure_postgres_tables_cached(conn_url: str, schema: str) -> str:
+    """Cache long pour eviter de recreer/verifier les tables a chaque rerun."""
+    return ensure_postgres_tables(conn_url, schema)
+
+
+def get_local_pg_config_status() -> dict[str, object]:
+    """Retourne un diagnostic de lecture du fichier pg_config.local.json (sans exposer le secret)."""
+    status: dict[str, object] = {
+        "path": str(LOCAL_PG_CONFIG_PATH),
+        "exists": LOCAL_PG_CONFIG_PATH.exists(),
+        "error": "",
+        "keys": [],
+        "has_password": False,
+    }
+    if not status["exists"]:
+        return status
+    try:
+        raw = json.loads(LOCAL_PG_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        status["error"] = f"JSON invalide: {exc}"
+        return status
+    if not isinstance(raw, dict):
+        status["error"] = "Contenu JSON non-objet (attendu un dictionnaire)."
+        return status
+    status["keys"] = sorted([str(k) for k in raw.keys()])
+    status["has_password"] = bool(str(raw.get("password", "")).strip())
+    return status
+
+
+def get_auth_secret() -> str:
+    """Secret local pour signer la session 'se souvenir de moi'."""
+    return get_secret_or_env("DASHBOARD_AUTH_SECRET", "local-dev-secret")
+
+
+def _sign_auth_payload(username: str, role: str, expires_at: str) -> str:
+    payload = f"{username}|{role}|{expires_at}"
+    secret = get_auth_secret().encode("utf-8")
+    return hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def save_auth_session(username: str, role: str) -> None:
+    """Persiste une session locale (pour eviter un re-login apres refresh)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    expires = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=AUTH_SESSION_DAYS)).isoformat()
+    signature = _sign_auth_payload(username, role, expires)
+    payload = {"username": username, "role": role, "expires_at": expires, "sig": signature}
+    AUTH_SESSION_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_auth_session() -> None:
+    if AUTH_SESSION_PATH.exists():
+        try:
+            AUTH_SESSION_PATH.unlink()
+        except Exception:
+            pass
+
+
+def load_auth_session() -> tuple[bool, str, str]:
+    """Lit la session locale si valide (signature + expiration)."""
+    if not AUTH_SESSION_PATH.exists():
+        return False, "", ""
+    try:
+        raw = json.loads(AUTH_SESSION_PATH.read_text(encoding="utf-8"))
+        username = str(raw.get("username", "")).strip()
+        role = str(raw.get("role", "")).strip()
+        expires_at = str(raw.get("expires_at", "")).strip()
+        sig = str(raw.get("sig", "")).strip()
+        if not username or not role or not expires_at or not sig:
+            clear_auth_session()
+            return False, "", ""
+        if pd.Timestamp.now(tz="UTC") > pd.to_datetime(expires_at, utc=True, errors="coerce"):
+            clear_auth_session()
+            return False, "", ""
+        if not hmac.compare_digest(sig, _sign_auth_payload(username, role, expires_at)):
+            clear_auth_session()
+            return False, "", ""
+        return True, username, role
+    except Exception:
+        clear_auth_session()
+        return False, "", ""
+
+
+def save_local_pg_config(config: PostgresConfig) -> tuple[bool, str]:
+    """Ecrit pg_config.local.json pour persister la connexion PostgreSQL."""
+    payload = {
+        "host": str(config.host or "").strip(),
+        "port": str(config.port or "").strip(),
+        "database": str(config.database or "").strip(),
+        "user": str(config.user or "").strip(),
+        "password": str(config.password or "").strip(),
+        "schema": str(config.schema or "").strip(),
+        "sslmode": str(config.sslmode or "").strip(),
+    }
+    try:
+        LOCAL_PG_CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, f"Configuration enregistrée: {LOCAL_PG_CONFIG_PATH}"
+    except Exception as exc:
+        return False, f"Echec sauvegarde pg_config.local.json: {exc}"
 
 
 def normalize_dashboard_role(role: str) -> str:
@@ -394,11 +579,11 @@ def load_dashboard_users(cfg_override: PostgresConfig | None = None) -> tuple[di
     Mode par defaut: PostgreSQL.
     Pour activer le fallback auto: DASHBOARD_AUTH_SOURCE=auto
     """
-    mode = get_secret_or_env("DASHBOARD_AUTH_SOURCE", "postgres").strip().lower()
+    mode = get_secret_or_env("DASHBOARD_AUTH_SOURCE", "auto").strip().lower()
     cfg = cfg_override or default_postgres_config()
     if not str(cfg.password or "").strip():
         if mode == "postgres":
-            return {}, "postgres-error: mot de passe PostgreSQL manquant (champ 'Mot de passe auth')."
+            return {}, "postgres-error: mot de passe PostgreSQL manquant (variables PG*)."
         return load_dashboard_users_from_secrets()
     try:
         ok, db_message = ensure_postgres_database(cfg)
@@ -493,6 +678,9 @@ def set_dashboard_user_active(cfg: PostgresConfig, username: str, is_active: boo
 def render_dashboard_users_admin(cfg: PostgresConfig, current_user: str) -> None:
     """Panneau admin pour gerer les comptes utilisateurs du dashboard."""
     with st.sidebar.expander("Gestion utilisateurs dashboard", expanded=False):
+        if not str(cfg.password or "").strip():
+            st.info("Configuration PostgreSQL incomplète: mot de passe manquant. Ajoutez-le dans `pg_config.local.json` ou via PG*.")
+            return
         try:
             ok, db_message = ensure_postgres_database(cfg)
             if not ok:
@@ -553,53 +741,46 @@ def render_dashboard_users_admin(cfg: PostgresConfig, current_user: str) -> None
                     set_dashboard_user_active(cfg, target_user, target_status == "Activer")
                     st.success("Statut utilisateur mis a jour.")
                     st.rerun()
-        except Exception as exc:
-            st.error(f"Gestion utilisateurs indisponible: {exc}")
+        except Exception:
+            st.error("Gestion utilisateurs indisponible: connexion PostgreSQL échouée. Vérifiez PGHOST/PGUSER/PGPASSWORD.")
 
 
 def render_auth_sidebar() -> tuple[bool, str, str]:
     """Gere la connexion applicative et retourne (ok, username, role)."""
-    cfg_default = default_postgres_config()
-    with st.sidebar.expander("Configuration auth PostgreSQL", expanded=True):
-        st.caption("Renseignez la connexion PostgreSQL utilisee pour l'authentification.")
-        auth_host = st.text_input("Host auth", value=cfg_default.host, key="auth_pg_host")
-        auth_port = st.text_input("Port auth", value=cfg_default.port, key="auth_pg_port")
-        auth_database = st.text_input("Base auth", value=cfg_default.database, key="auth_pg_database")
-        auth_user = st.text_input("Utilisateur auth", value=cfg_default.user, key="auth_pg_user")
-        auth_password = st.text_input("Mot de passe auth", value=cfg_default.password, type="password", key="auth_pg_password")
-        auth_schema = st.text_input("Schema auth", value=cfg_default.schema, key="auth_pg_schema")
-        auth_sslmode = st.selectbox(
-            "SSL mode auth",
-            options=["prefer", "disable", "require", "verify-ca", "verify-full"],
-            index=["prefer", "disable", "require", "verify-ca", "verify-full"].index(cfg_default.sslmode)
-            if cfg_default.sslmode in {"prefer", "disable", "require", "verify-ca", "verify-full"}
-            else 0,
-            key="auth_pg_sslmode",
-        )
-
-    auth_cfg = PostgresConfig(
-        host=auth_host.strip() or DEFAULT_DB_HOST,
-        port=auth_port.strip() or DEFAULT_DB_PORT,
-        database=auth_database.strip() or DEFAULT_DB_NAME,
-        user=auth_user.strip() or DEFAULT_DB_USER,
-        password=auth_password,
-        schema=sanitize_identifier(auth_schema.strip() or DEFAULT_DB_SCHEMA, DEFAULT_DB_SCHEMA),
-        sslmode=auth_sslmode,
-    )
+    auth_cfg = default_postgres_config()
 
     users, source = load_dashboard_users(auth_cfg)
     if source.startswith("postgres-error"):
         st.sidebar.error(f"Authentification PostgreSQL indisponible: {source}")
-        st.sidebar.info("Verifiez surtout le mot de passe PostgreSQL (auth), puis la table dashboard_users.")
+        st.sidebar.info("Renseignez les variables PG* ou le fichier pg_config.local.json pour activer l'authentification.")
+        diag = get_local_pg_config_status()
+        if diag["exists"]:
+            st.sidebar.caption(
+                f"pg_config.local.json detecte: {diag['path']} | "
+                f"cles: {', '.join(diag['keys']) or 'aucune'} | "
+                f"mot de passe present: {'oui' if diag['has_password'] else 'non'}"
+                + (f" | {diag['error']}" if diag["error"] else "")
+            )
+        else:
+            st.sidebar.caption(f"pg_config.local.json introuvable: {diag['path']}")
         return False, "", "utilisateur"
-    if source == "fallback-dev":
-        st.sidebar.warning("Utilisateurs fallback actifs (admin/admin, user/user). Configurez PostgreSQL en production.")
-    elif source.startswith("PostgreSQL"):
-        st.sidebar.caption(f"Auth source: {source}")
+    # Ne pas afficher de message technique sur la source d'authentification.
 
     auth_ok = bool(st.session_state.get("auth_ok", False))
     auth_user = str(st.session_state.get("auth_user", ""))
     auth_role = str(st.session_state.get("auth_role", "utilisateur"))
+
+    if not auth_ok:
+        remembered_ok, remembered_user, remembered_role = load_auth_session()
+        if remembered_ok and remembered_user:
+            if remembered_user in users:
+                role = users[remembered_user]["role"]
+            else:
+                role = normalize_dashboard_role(remembered_role)
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_user"] = remembered_user
+            st.session_state["auth_role"] = role
+            return True, remembered_user, role
 
     if auth_ok and auth_user:
         st.sidebar.success(f"Connecte: {auth_user} ({auth_role})")
@@ -607,12 +788,14 @@ def render_auth_sidebar() -> tuple[bool, str, str]:
             st.session_state["auth_ok"] = False
             st.session_state["auth_user"] = ""
             st.session_state["auth_role"] = "utilisateur"
+            clear_auth_session()
             st.rerun()
         return True, auth_user, auth_role
 
     with st.sidebar.expander("Connexion utilisateur", expanded=True):
         username = st.text_input("Nom d'utilisateur", key="login_username")
         password = st.text_input("Mot de passe", type="password", key="login_password")
+        remember = st.checkbox("Rester connecte (7 jours)", value=True, key="login_remember")
         if st.button("Se connecter", key="login_button"):
             if username not in users:
                 st.error("Utilisateur inconnu.")
@@ -623,6 +806,10 @@ def render_auth_sidebar() -> tuple[bool, str, str]:
                     st.session_state["auth_ok"] = True
                     st.session_state["auth_user"] = username
                     st.session_state["auth_role"] = role
+                    if remember:
+                        save_auth_session(username, role)
+                    else:
+                        clear_auth_session()
                     st.rerun()
                 st.error("Mot de passe invalide.")
     st.info("Connectez-vous pour acceder au tableau de bord.")
@@ -681,6 +868,43 @@ def build_pg_url(config: PostgresConfig, database_override: str | None = None) -
         f"postgresql+psycopg://{auth}@{config.host}:{config.port}/{quote_plus(database_name)}"
         f"?sslmode={config.sslmode}"
     )
+
+
+def load_rdc_geojson() -> tuple[dict | None, str]:
+    """Charge un geojson RDC depuis data/rdc_provinces.geojson ou RDC_GEOJSON_PATH."""
+    custom = get_secret_or_env("RDC_GEOJSON_PATH", "").strip()
+    candidate = Path(custom) if custom else (DATA_DIR / "rdc_provinces.geojson")
+    if not candidate.exists():
+        return None, str(candidate)
+    try:
+        return json.loads(candidate.read_text(encoding="utf-8")), str(candidate)
+    except Exception:
+        return None, str(candidate)
+
+
+def detect_geojson_feature_key(geojson: dict, provinces: list[str]) -> str | None:
+    """Tente de deviner la cle des provinces dans un geojson (properties.*)."""
+    features = geojson.get("features", []) if isinstance(geojson, dict) else []
+    if not features:
+        return None
+    props = features[0].get("properties", {})
+    if not isinstance(props, dict):
+        return None
+    province_norm = {normalize_text(p) for p in provinces if p}
+    best_key = None
+    best_score = -1
+    for key in props.keys():
+        values = []
+        for feat in features:
+            val = feat.get("properties", {}).get(key, "")
+            values.append(normalize_text(val))
+        score = sum(1 for v in values if v in province_norm)
+        if score > best_score:
+            best_score = score
+            best_key = key
+    if best_key is None:
+        return None
+    return f"properties.{best_key}"
 
 
 @st.cache_resource(show_spinner=False)
@@ -792,7 +1016,7 @@ def normalize_status(value: object) -> str:
     norm = normalize_text(value)
     if any(token in norm for token in ["resolu", "resolved", "traite", "cloture", "ferme", "close"]):
         return "Resolu"
-    if any(token in norm for token in ["non", "ouvert", "pending", "attente", "cours"]):
+    if any(token in norm for token in ["non", "ouvert", "pending", "attente", "cours", "En cours"]):
         return "Non resolu"
     return "Non resolu"
 
@@ -837,6 +1061,43 @@ def is_mostly_numeric_series(series: pd.Series, threshold: float = 0.6) -> bool:
         return False
     numeric_like = text.str.fullmatch(r"[0-9\+\-\s\(\)]{6,}", na=False)
     return float(numeric_like.mean()) >= threshold
+
+
+def is_status_like_series(series: pd.Series, threshold: float = 0.6) -> bool:
+    """Detecte une colonne qui ressemble a un statut (Resolu/Non resolu)."""
+    if series is None or len(series) == 0:
+        return False
+    text = series.fillna("").astype(str).str.strip()
+    text = text[text != ""]
+    if text.empty:
+        return False
+    norm = text.map(normalize_text)
+    allowed = {
+        "resolu",
+        "non resolu",
+        "nonresolu",
+        "non",
+        "cloture",
+        "ferme",
+        "close",
+        "traite",
+        "en cours",
+    }
+    ratio = float(norm.isin(allowed).mean())
+    return ratio >= threshold
+
+
+def is_rich_text_series(series: pd.Series, min_len: int = 12) -> bool:
+    """Detecte une colonne texte descriptive (ex: resolution narrative)."""
+    if series is None or len(series) == 0:
+        return False
+    text = series.fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    text = text[text != ""]
+    if text.empty:
+        return False
+    avg_len = float(text.str.len().mean())
+    unique_ratio = float(text.nunique()) / float(len(text)) if len(text) else 0.0
+    return avg_len >= min_len and unique_ratio >= 0.2
 
 
 def choose_details_column(raw: pd.DataFrame, mapping: dict[str, str]) -> str | None:
@@ -889,6 +1150,8 @@ def make_column_map(df: pd.DataFrame, aliases: dict[str, list[str]]) -> dict[str
         for col, norm_col in normalized_cols.items():
             if col in used:
                 continue
+            if target in {"nom", "prenom"} and any(tok in norm_col for tok in ["qualif", "qualification"]):
+                continue
             if any(pattern in norm_col for pattern in patterns):
                 chosen = col
                 break
@@ -896,6 +1159,34 @@ def make_column_map(df: pd.DataFrame, aliases: dict[str, list[str]]) -> dict[str
             selected[target] = chosen
             used.add(chosen)
     return selected
+
+
+def apply_positional_mapping(raw: pd.DataFrame, mapping: dict[str, str]) -> dict[str, str]:
+    """Fallback par position si les en-tetes ne sont pas fiables."""
+    expected_order = [
+        "date",
+        "heure",
+        "numero",
+        "province",
+        "territoire",
+        "genre",
+        "nom",
+        "prenom",
+        "categorie",
+        "incident",
+        "details",
+        "resolution",
+    ]
+    if raw.shape[1] < len(expected_order):
+        return mapping
+    for idx, key in enumerate(expected_order):
+        if key in mapping:
+            continue
+        col = raw.columns[idx]
+        if "unnamed" in normalize_text(col):
+            continue
+        mapping[key] = col
+    return mapping
 
 
 def parse_month_from_label(label: object) -> tuple[pd.Timestamp | None, str]:
@@ -961,6 +1252,20 @@ def parse_time_delta_series(series: pd.Series) -> pd.Series:
     text_delta = pd.to_timedelta(series.astype(str), errors="coerce")
     delta = delta.fillna(text_delta)
     return delta
+
+
+def format_time_series(series: pd.Series) -> pd.Series:
+    """Formate une colonne heure en HH:MM:SS (gère fractions Excel et textes)."""
+    if series is None or len(series) == 0:
+        return series
+    delta = parse_time_delta_series(series)
+    seconds = delta.dt.total_seconds()
+    parsed_dt = pd.to_datetime(series, errors="coerce")
+    seconds = seconds.fillna(parsed_dt.dt.hour * 3600 + parsed_dt.dt.minute * 60 + parsed_dt.dt.second)
+    seconds = seconds.fillna(0).astype(int) % 86400
+    formatted = pd.to_timedelta(seconds, unit="s").astype(str)
+    formatted = formatted.str.replace("0 days ", "", regex=False)
+    return formatted
 
 
 def parse_datetime_columns(df: pd.DataFrame, date_col: str | None, hour_col: str | None) -> pd.Series:
@@ -1128,13 +1433,21 @@ def standardize_calls(raw: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "date",
+                "heure",
+                "numero",
+                "nom",
+                "prenom",
                 "province",
                 "territoire",
+                "item",
                 "details",
+                "details_appel",
                 "incident",
+                "type_pathologie",
                 "categorie",
                 "genre",
                 "statut",
+                "resolution",
                 "record_count",
                 "source_file",
                 "sheet_name",
@@ -1142,12 +1455,22 @@ def standardize_calls(raw: pd.DataFrame) -> pd.DataFrame:
         )
 
     mapping = make_column_map(raw, CALL_COLUMN_ALIASES)
+    mapping = apply_positional_mapping(raw, mapping)
     out = pd.DataFrame(index=raw.index)
 
     out["date"] = parse_datetime_columns(raw, mapping.get("date"), mapping.get("heure"))
+    if "heure" in mapping:
+        out["heure"] = format_time_series(raw[mapping["heure"]])
+    else:
+        out["heure"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%H:%M:%S")
+
+    out["numero"] = raw[mapping["numero"]] if "numero" in mapping else ""
+    out["nom"] = raw[mapping["nom"]] if "nom" in mapping else ""
+    out["prenom"] = raw[mapping["prenom"]] if "prenom" in mapping else ""
 
     out["province"] = raw[mapping["province"]] if "province" in mapping else "Inconnu"
     out["territoire"] = raw[mapping["territoire"]] if "territoire" in mapping else out["province"]
+    out["item"] = raw[mapping["item"]] if "item" in mapping else ""
 
     details_col = choose_details_column(raw, mapping)
     if details_col:
@@ -1161,6 +1484,33 @@ def standardize_calls(raw: pd.DataFrame) -> pd.DataFrame:
     out["categorie"] = raw[mapping["categorie"]] if "categorie" in mapping else "Non classe"
     out["genre"] = raw[mapping["genre"]] if "genre" in mapping else "ND"
     out["statut"] = raw[mapping["statut"]] if "statut" in mapping else "Non resolu"
+    out["details_appel"] = out["details"]
+    out["type_pathologie"] = out["incident"]
+    resolution_from_index = False
+    res_col = mapping.get("resolution")
+    res_series = raw[res_col] if res_col and res_col in raw.columns else None
+    is_standardized_input = any(col in raw.columns for col in ["source_file", "sheet_name", "source_kind"])
+    col_p = None if is_standardized_input else (raw.columns[15] if raw.shape[1] >= 16 else None)
+    col_p_series = raw[col_p] if col_p is not None else None
+
+    col_p_has_text = False
+    if col_p_series is not None:
+        col_p_text = col_p_series.fillna("").astype(str).str.strip()
+        non_empty_ratio = float((col_p_text != "").mean()) if len(col_p_text) else 0.0
+        col_p_has_text = non_empty_ratio >= 0.05 and not is_mostly_numeric_series(col_p_series)
+
+    # Regle voulue: privilegier la colonne P si elle contient du texte (valeurs de resolution),
+    # sauf si les donnees sont deja standardisees (lecture PostgreSQL).
+    if col_p_series is not None and col_p_has_text:
+        out["resolution"] = col_p_series
+        resolution_from_index = True
+    elif res_series is not None:
+        out["resolution"] = res_series
+    elif col_p_series is not None:
+        out["resolution"] = col_p_series
+        resolution_from_index = True
+    else:
+        out["resolution"] = out["statut"]
 
     if "record_count" in mapping:
         out["record_count"] = pd.to_numeric(raw[mapping["record_count"]], errors="coerce").fillna(1)
@@ -1184,6 +1534,16 @@ def standardize_calls(raw: pd.DataFrame) -> pd.DataFrame:
     out["genre"] = out["genre"].map(normalize_gender)
     out["statut"] = out["statut"].map(normalize_status)
     out["record_count"] = pd.to_numeric(out["record_count"], errors="coerce").fillna(1).clip(lower=0)
+    out["numero"] = out["numero"].map(lambda x: clean_label(x, ""))
+    out["nom"] = out["nom"].map(lambda x: clean_label(x, ""))
+    out["prenom"] = out["prenom"].map(lambda x: clean_label(x, ""))
+    out["item"] = out["item"].map(lambda x: clean_label(x, ""))
+    out["details_appel"] = out["details"]
+    out["type_pathologie"] = out["incident"]
+    if "resolution" in mapping or resolution_from_index:
+        out["resolution"] = out["resolution"].map(lambda x: clean_label(x, ""))
+    else:
+        out["resolution"] = out["statut"]
 
     # Trace les metadonnees de provenance quand elles existent deja (lecture PostgreSQL).
     if "source_file" in raw.columns:
@@ -1274,15 +1634,49 @@ def standardize_alerts(raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def detect_excel_dataset_kind(raw: pd.DataFrame) -> str:
+def detect_excel_dataset_kind(raw: pd.DataFrame, file_name: str | None = None) -> str:
     """
     Detection souple du type de fichier.
-    Si l'entete est identique (cas frequent), on favorise APPELS.
+    - si le nom du fichier contient "appel" ou "alerte", on priorise.
+    - sinon, on compare un score "appels" vs "alertes" (avec mapping positionnel).
     """
+    file_hint = normalize_text(file_name or "")
+    if "alerte" in file_hint:
+        return "alerts"
+    if "appel" in file_hint:
+        return "calls"
+
     call_map = make_column_map(raw, CALL_COLUMN_ALIASES)
+    call_map = apply_positional_mapping(raw, call_map)
     alert_map = make_column_map(raw, ALERT_COLUMN_ALIASES)
-    call_score = sum(col in call_map for col in ["date", "province", "territoire", "incident", "categorie", "genre", "statut", "record_count"])
+
+    call_score = sum(
+        col in call_map
+        for col in [
+            "date",
+            "province",
+            "territoire",
+            "incident",
+            "categorie",
+            "genre",
+            "statut",
+            "record_count",
+            "numero",
+            "item",
+            "heure",
+        ]
+    )
     alert_score = sum(col in alert_map for col in ["date", "location", "indicator", "value", "details"])
+
+    if "numero" in call_map:
+        call_score += 2
+    if "genre" in call_map:
+        call_score += 1
+    if "value" in alert_map:
+        alert_score += 2
+    if raw.shape[1] >= 10:
+        call_score += 1
+
     return "calls" if call_score >= alert_score else "alerts"
 
 
@@ -1302,13 +1696,21 @@ def alerts_to_calls_dataframe(alerts_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(
         {
             "date": pd.to_datetime(work["date"], errors="coerce"),
+            "heure": pd.to_datetime(work["date"], errors="coerce").dt.strftime("%H:%M:%S"),
+            "numero": "",
+            "nom": "",
+            "prenom": "",
             "province": province,
             "territoire": territory,
+            "item": "",
             "details": work["details"].fillna("").astype(str),
+            "details_appel": work["details"].fillna("").astype(str),
             "incident": work["indicator"].map(canonical_pathology_name).fillna("Non precise"),
+            "type_pathologie": work["indicator"].map(canonical_pathology_name).fillna("Non precise"),
             "categorie": "Alerte",
             "genre": "ND",
             "statut": "Non resolu",
+            "resolution": "Non resolu",
             "record_count": pd.to_numeric(work["value"], errors="coerce").fillna(0),
             "source_file": work.get("source_file", "-"),
             "sheet_name": work.get("sheet_name", "-"),
@@ -1381,7 +1783,7 @@ def load_unified_data(uploaded_files: list[object] | None) -> tuple[pd.DataFrame
     for file_obj in files:
         try:
             frame, sheet = read_excel_best_sheet_from_bytes(file_obj.getvalue())
-            kind = detect_excel_dataset_kind(frame)
+            kind = detect_excel_dataset_kind(frame, file_obj.name)
             if kind == "alerts":
                 clean_alerts = standardize_alerts(frame)
                 clean_alerts["source_file"] = str(file_obj.name)
@@ -1404,8 +1806,44 @@ def load_unified_data(uploaded_files: list[object] | None) -> tuple[pd.DataFrame
     else:
         calls_df = empty_calls_dataframe()
 
+    # Deduplication locale (meme logique que PostgreSQL) pour aligner les chiffres.
+    duplicate_rows = 0
+    if not calls_df.empty:
+        calls_df = calls_df.copy()
+        if "source_kind" not in calls_df.columns:
+            calls_df["source_kind"] = "calls"
+        if "nom" not in calls_df.columns:
+            calls_df["nom"] = ""
+        if "prenom" not in calls_df.columns:
+            calls_df["prenom"] = ""
+        calls_df["row_hash"] = row_hash_from_columns(
+            calls_df,
+            [
+                "date",
+                "numero",
+                "nom",
+                "prenom",
+                "province",
+                "territoire",
+                "details",
+                "incident",
+                "categorie",
+                "genre",
+                "statut",
+                "record_count",
+                "source_kind",
+            ],
+        )
+        before = len(calls_df)
+        calls_df = calls_df.drop_duplicates(subset=["row_hash"]).copy()
+        duplicate_rows = max(before - len(calls_df), 0)
+        calls_df.drop(columns=["row_hash"], errors="ignore", inplace=True)
+
     alerts_df = calls_to_alerts_dataframe(calls_df)
-    calls_note = f"{len(files)} fichier(s) Excel importe(s) en table unique."
+    calls_only = filter_calls_only(calls_df)
+    calls_note = f"{format_int(len(calls_only))} ligne(s) APPELS chargee(s) depuis upload."
+    if duplicate_rows:
+        calls_note += f" | Doublons ignores: {format_int(duplicate_rows)}"
     if loaded_files:
         calls_note += " " + " | ".join(loaded_files[:5])
         if len(loaded_files) > 5:
@@ -1424,13 +1862,21 @@ def empty_calls_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
             "date",
+            "heure",
+            "numero",
+            "nom",
+            "prenom",
             "province",
             "territoire",
+            "item",
             "details",
+            "details_appel",
             "incident",
+            "type_pathologie",
             "categorie",
             "genre",
             "statut",
+            "resolution",
             "record_count",
             "source_file",
             "sheet_name",
@@ -1458,13 +1904,21 @@ def ensure_postgres_tables(conn_url: str, schema: str) -> str:
                 CREATE TABLE IF NOT EXISTS {records_sql} (
                     id BIGSERIAL PRIMARY KEY,
                     date TIMESTAMP,
+                    heure TEXT,
+                    numero TEXT,
+                    nom TEXT,
+                    prenom TEXT,
                     province TEXT,
                     territoire TEXT,
+                    item TEXT,
                     details TEXT,
+                    details_appel TEXT,
                     incident TEXT,
+                    type_pathologie TEXT,
                     categorie TEXT,
                     genre TEXT,
                     statut TEXT,
+                    resolution TEXT,
                     record_count DOUBLE PRECISION,
                     source_file TEXT,
                     sheet_name TEXT,
@@ -1493,6 +1947,14 @@ def ensure_postgres_tables(conn_url: str, schema: str) -> str:
         )
         conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS source_kind TEXT"))
         conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS row_hash TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS heure TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS numero TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS nom TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS prenom TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS item TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS type_pathologie TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS details_appel TEXT"))
+        conn.execute(text(f"ALTER TABLE {records_sql} ADD COLUMN IF NOT EXISTS resolution TEXT"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{RECORDS_TABLE}_date ON {records_sql} (date)"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{RECORDS_TABLE}_province ON {records_sql} (province)"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{RECORDS_TABLE}_source_kind ON {records_sql} (source_kind)"))
@@ -1587,7 +2049,27 @@ def read_calls_from_postgres(conn_url: str, schema: str) -> pd.DataFrame:
     table_sql = f"{quote_ident(schema_name)}.{quote_ident(RECORDS_TABLE)}"
     query = text(
         f"""
-        SELECT date, province, territoire, details, incident, categorie, genre, statut, record_count, source_file, sheet_name, source_kind
+        SELECT
+            date,
+            heure,
+            numero,
+            nom,
+            prenom,
+            province,
+            territoire,
+            item,
+            details,
+            details_appel,
+            incident,
+            type_pathologie,
+            categorie,
+            genre,
+            statut,
+            resolution,
+            record_count,
+            source_file,
+            sheet_name,
+            source_kind
         FROM {table_sql}
         """
     )
@@ -1605,14 +2087,25 @@ def read_alerts_from_postgres(conn_url: str, schema: str) -> pd.DataFrame:
 
 
 def load_postgres_data(conn_url: str, schema: str, db_label: str) -> tuple[pd.DataFrame, DataSourceInfo, pd.DataFrame, DataSourceInfo]:
-    schema_name = ensure_postgres_tables(conn_url, schema)
+    schema_name = ensure_postgres_tables_cached(conn_url, schema)
     calls_df = read_calls_from_postgres(conn_url, schema_name)
     alerts_df = read_alerts_from_postgres(conn_url, schema_name)
+    calls_only = filter_calls_only(calls_df)
     calls_info = DataSourceInfo(
         source=db_label,
         sheet_name=f"{schema_name}.{RECORDS_TABLE}",
-        note=f"{format_int(len(calls_df))} ligne(s) lue(s) depuis la table unique PostgreSQL.",
+        note=f"{format_int(len(calls_only))} ligne(s) APPELS lue(s) depuis la table unique PostgreSQL.",
     )
+    if (
+        calls_only is not None
+        and calls_only.empty
+        and isinstance(calls_df, pd.DataFrame)
+        and not calls_df.empty
+        and "source_kind" in calls_df.columns
+    ):
+        kind_counts = calls_df["source_kind"].fillna("inconnu").astype(str).str.lower().value_counts()
+        if "alerts" in kind_counts and kind_counts.get("alerts", 0) == len(calls_df):
+            calls_info.note += " | Astuce: vos imports sont tagués 'alerts' (verifiez le type de fichier puis reimportez)."
     alerts_info = DataSourceInfo(
         source=db_label,
         sheet_name=f"{schema_name}.{RECORDS_TABLE} (derive)",
@@ -1629,6 +2122,136 @@ def compute_file_hash(binary: bytes) -> str:
 def csv_text(values: list[str]) -> str:
     """Transforme une liste en texte CSV lisible pour le rapport."""
     return ", ".join(values) if values else "-"
+
+
+def build_cleaned_excel_bundle(excel_files: list[object] | None) -> tuple[bytes | None, pd.DataFrame]:
+    """Prepare un fichier Excel nettoye (dedup + colonnes standardisees) avant import."""
+    prepared = prepare_unified_files_for_postgres(excel_files)
+    if not prepared:
+        return None, pd.DataFrame()
+
+    cleaned_frames: list[pd.DataFrame] = []
+    report_rows: list[dict[str, object]] = []
+
+    for report in prepared:
+        if report.get("status") != "ready":
+            report_rows.append({k: v for k, v in report.items() if k != "data"})
+            continue
+        df = report.get("data")
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            report_rows.append({k: v for k, v in report.items() if k != "data"})
+            continue
+
+        work = df.copy()
+        if "source_kind" not in work.columns:
+            work["source_kind"] = report.get("dataset_type", "calls")
+        if "nom" not in work.columns:
+            work["nom"] = ""
+        if "prenom" not in work.columns:
+            work["prenom"] = ""
+        work["row_hash"] = row_hash_from_columns(
+            work,
+            [
+                "date",
+                "numero",
+                "nom",
+                "prenom",
+                "province",
+                "territoire",
+                "details",
+                "incident",
+                "categorie",
+                "genre",
+                "statut",
+                "record_count",
+                "source_kind",
+            ],
+        )
+        before = len(work)
+        work = work.drop_duplicates(subset=["row_hash"]).copy()
+        removed = max(before - len(work), 0)
+        report_rows.append(
+            {
+                **{k: v for k, v in report.items() if k != "data"},
+                "rows_cleaned": int(len(work)),
+                "duplicate_rows": int(removed),
+            }
+        )
+        work.drop(columns=["row_hash"], errors="ignore", inplace=True)
+        cleaned_frames.append(work)
+
+    if cleaned_frames:
+        merged = pd.concat(cleaned_frames, ignore_index=True)
+        if "source_kind" not in merged.columns:
+            merged["source_kind"] = "calls"
+        if "nom" not in merged.columns:
+            merged["nom"] = ""
+        if "prenom" not in merged.columns:
+            merged["prenom"] = ""
+        merged["row_hash"] = row_hash_from_columns(
+            merged,
+            [
+                "date",
+                "numero",
+                "nom",
+                "prenom",
+                "province",
+                "territoire",
+                "details",
+                "incident",
+                "categorie",
+                "genre",
+                "statut",
+                "record_count",
+                "source_kind",
+            ],
+        )
+        before_all = len(merged)
+        merged = merged.drop_duplicates(subset=["row_hash"]).copy()
+        cross_removed = max(before_all - len(merged), 0)
+        merged.drop(columns=["row_hash"], errors="ignore", inplace=True)
+    else:
+        merged = empty_calls_dataframe()
+        cross_removed = 0
+
+    report_df = pd.DataFrame(report_rows)
+    if not report_df.empty:
+        report_df["duplicates_across_files"] = cross_removed
+
+    export_cols = [
+        "date",
+        "heure",
+        "numero",
+        "nom",
+        "prenom",
+        "province",
+        "territoire",
+        "item",
+        "details",
+        "details_appel",
+        "incident",
+        "type_pathologie",
+        "categorie",
+        "genre",
+        "statut",
+        "resolution",
+        "record_count",
+        "source_file",
+        "sheet_name",
+        "source_kind",
+    ]
+    for col in export_cols:
+        if col not in merged.columns:
+            merged[col] = None
+    merged = merged[export_cols]
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        merged.to_excel(writer, sheet_name="call_center_records", index=False)
+        if not report_df.empty:
+            report_df.to_excel(writer, sheet_name="import_report", index=False)
+    output.seek(0)
+    return output.getvalue(), report_df
 
 
 def detect_missing_rows_calls(df: pd.DataFrame) -> int:
@@ -1770,6 +2393,172 @@ def write_import_audit(conn, schema_name: str, report: dict[str, object]) -> Non
     )
 
 
+def count_duplicate_rows(conn_url: str, schema: str) -> int:
+    """Compte le nombre de doublons base (row_hash)."""
+    df = fetch_hash_basis(conn_url, schema)
+    if df.empty:
+        return 0
+    df["row_hash"] = compute_row_hash_for_df(df)
+    dup_count = int(df.duplicated(subset=["row_hash"], keep="first").sum())
+    return dup_count
+
+
+def fetch_hash_basis(
+    conn_url: str,
+    schema: str,
+    min_date: pd.Timestamp | None = None,
+    max_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Charge les colonnes necessaires pour recalculer row_hash."""
+    schema_name = sanitize_identifier(schema, DEFAULT_DB_SCHEMA)
+    table_sql = f"{quote_ident(schema_name)}.{quote_ident(RECORDS_TABLE)}"
+    engine = get_pg_engine(conn_url)
+    where_clause = ""
+    params: dict[str, object] = {}
+    if pd.notna(min_date) and pd.notna(max_date):
+        where_clause = "WHERE date BETWEEN :min_date AND :max_date"
+        params = {
+            "min_date": pd.to_datetime(min_date, errors="coerce"),
+            "max_date": pd.to_datetime(max_date, errors="coerce"),
+        }
+    query = text(
+        f"""
+        SELECT
+            id,
+            date,
+            numero,
+            nom,
+            prenom,
+            province,
+            territoire,
+            details,
+            incident,
+            categorie,
+            genre,
+            statut,
+            record_count,
+            source_kind,
+            source_file
+        FROM {table_sql}
+        {where_clause}
+        """
+    )
+    with engine.connect() as conn:
+        return pd.read_sql_query(query, conn, params=params)
+
+
+def compute_row_hash_for_df(df: pd.DataFrame) -> pd.Series:
+    return row_hash_from_columns(
+        df,
+        [
+            "date",
+            "numero",
+            "nom",
+            "prenom",
+            "province",
+            "territoire",
+            "details",
+            "incident",
+            "categorie",
+            "genre",
+            "statut",
+            "record_count",
+            "source_kind",
+        ],
+    )
+
+
+def build_duplicate_report(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    work["row_hash"] = compute_row_hash_for_df(work)
+    work["__sort_date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["__sort_source"] = work["source_file"].fillna("").astype(str)
+    work = work.sort_values(
+        ["row_hash", "__sort_date", "__sort_source"],
+        ascending=[True, False, False],
+        na_position="last",
+    )
+    dup_mask = work.duplicated(subset=["row_hash"], keep="first")
+    report = work.loc[dup_mask].copy()
+    report.drop(columns=["__sort_date", "__sort_source"], errors="ignore", inplace=True)
+    return report
+
+
+def recompute_and_dedup(conn_url: str, schema: str) -> tuple[int, int, int]:
+    """Recalcule row_hash, supprime les doublons, recrée l'index unique."""
+    schema_name = sanitize_identifier(schema, DEFAULT_DB_SCHEMA)
+    schema_sql = quote_ident(schema_name)
+    table_sql = f"{schema_sql}.{quote_ident(RECORDS_TABLE)}"
+    index_name = f"idx_{RECORDS_TABLE}_row_hash"
+    engine = get_pg_engine(conn_url)
+
+    df = fetch_hash_basis(conn_url, schema)
+    if df.empty:
+        return 0, 0, 0
+    df["row_hash"] = compute_row_hash_for_df(df)
+
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP INDEX IF EXISTS {schema_sql}.{quote_ident(index_name)}"))
+        for start in range(0, len(df), 2000):
+            chunk = df.iloc[start : start + 2000][["id", "row_hash"]]
+            conn.execute(
+                text(f"UPDATE {table_sql} SET row_hash = :row_hash WHERE id = :id"),
+                chunk.to_dict(orient="records"),
+            )
+        before = conn.execute(text(f"SELECT COUNT(*) FROM {table_sql}")).scalar_one()
+        conn.execute(
+            text(
+                f"""
+                WITH ranked AS (
+                    SELECT ctid, row_hash,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY row_hash
+                               ORDER BY date DESC NULLS LAST, source_file DESC NULLS LAST
+                           ) AS rn
+                    FROM {table_sql}
+                    WHERE row_hash IS NOT NULL
+                )
+                DELETE FROM {table_sql}
+                WHERE ctid IN (SELECT ctid FROM ranked WHERE rn > 1)
+                """
+            )
+        )
+        after = conn.execute(text(f"SELECT COUNT(*) FROM {table_sql}")).scalar_one()
+        conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS {quote_ident(index_name)} ON {table_sql} (row_hash)"))
+
+    read_calls_from_postgres.clear()
+    read_alerts_from_postgres.clear()
+    removed = int(before) - int(after)
+    return int(before), int(after), max(removed, 0)
+
+
+def purge_duplicate_rows(conn_url: str, schema: str) -> tuple[int, int]:
+    """Supprime les doublons exacts (row_hash) en gardant la ligne la plus recente."""
+    before, after, _ = recompute_and_dedup(conn_url, schema)
+    return int(before), int(after)
+
+
+def fetch_duplicate_rows(conn_url: str, schema: str) -> pd.DataFrame:
+    """Retourne les lignes qui seront supprimees lors du nettoyage des doublons."""
+    df = fetch_hash_basis(conn_url, schema)
+    return build_duplicate_report(df)
+
+
+def purge_all_imports(conn_url: str, schema: str) -> None:
+    """Purge complete: vide la table principale et l'historique d'import."""
+    schema_name = sanitize_identifier(schema, DEFAULT_DB_SCHEMA)
+    table_sql = f"{quote_ident(schema_name)}.{quote_ident(RECORDS_TABLE)}"
+    audit_sql = f"{quote_ident(schema_name)}.import_audit"
+    engine = get_pg_engine(conn_url)
+    with engine.begin() as conn:
+        conn.execute(text(f"TRUNCATE TABLE {table_sql}"))
+        conn.execute(text(f"TRUNCATE TABLE {audit_sql}"))
+    read_calls_from_postgres.clear()
+    read_alerts_from_postgres.clear()
+
+
 def prepare_calls_files_for_postgres(uploaded_files: list[object] | None) -> list[dict[str, object]]:
     """Prepare les fichiers APPELS: validation, standardisation, metadonnees et rapport."""
     files = [f for f in (uploaded_files or []) if f is not None]
@@ -1905,7 +2694,7 @@ def prepare_unified_files_for_postgres(uploaded_files: list[object] | None) -> l
         }
         try:
             raw, sheet = read_excel_best_sheet_from_bytes(file_obj.getvalue())
-            kind = detect_excel_dataset_kind(raw)
+            kind = detect_excel_dataset_kind(raw, file_obj.name)
             report["dataset_type"] = kind
             report["sheet_name"] = str(sheet)
 
@@ -1923,7 +2712,17 @@ def prepare_unified_files_for_postgres(uploaded_files: list[object] | None) -> l
                 clean = alerts_to_calls_dataframe(clean_alerts)
             else:
                 mapping = make_column_map(raw, CALL_COLUMN_ALIASES)
-                expected = ["date", "province", "territoire", "details", "incident", "categorie", "genre", "statut", "record_count"]
+                expected = [
+                    "date",
+                    "heure",
+                    "numero",
+                    "genre",
+                    "categorie",
+                    "incident",
+                    "item",
+                    "details",
+                    "statut",
+                ]
                 if "date" not in mapping:
                     report["status"] = "rejected"
                     report["message"] = "Colonne date absente/non reconnue: import refuse."
@@ -1967,9 +2766,41 @@ def write_records_to_postgres(records_df: pd.DataFrame, conn_url: str, schema: s
     work = records_df.copy()
     if "source_kind" not in work.columns:
         work["source_kind"] = "calls"
+    if "heure" not in work.columns:
+        work["heure"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%H:%M:%S")
+    else:
+        work["heure"] = format_time_series(work["heure"])
+    if "numero" not in work.columns:
+        work["numero"] = ""
+    if "nom" not in work.columns:
+        work["nom"] = ""
+    if "prenom" not in work.columns:
+        work["prenom"] = ""
+    if "item" not in work.columns:
+        work["item"] = ""
+    if "details_appel" not in work.columns:
+        work["details_appel"] = work.get("details", "")
+    if "type_pathologie" not in work.columns:
+        work["type_pathologie"] = work.get("incident", "")
+    if "resolution" not in work.columns:
+        work["resolution"] = work.get("statut", "")
     work["row_hash"] = row_hash_from_columns(
         work,
-        ["date", "province", "territoire", "details", "incident", "categorie", "genre", "statut", "record_count", "source_kind"],
+        [
+            "date",
+            "numero",
+            "nom",
+            "prenom",
+            "province",
+            "territoire",
+            "details",
+            "incident",
+            "categorie",
+            "genre",
+            "statut",
+            "record_count",
+            "source_kind",
+        ],
     )
     before_dedup = len(work)
     work = work.drop_duplicates(subset=["row_hash"]).copy()
@@ -1979,13 +2810,10 @@ def write_records_to_postgres(records_df: pd.DataFrame, conn_url: str, schema: s
     max_date = pd.to_datetime(work["date"], errors="coerce").max()
     existing_hashes: set[str] = set()
     if pd.notna(min_date) and pd.notna(max_date):
-        with engine.connect() as conn:
-            existing = pd.read_sql_query(
-                text(f"SELECT row_hash FROM {table_sql} WHERE date BETWEEN :min_date AND :max_date"),
-                conn,
-                params={"min_date": min_date, "max_date": max_date},
-            )
-        existing_hashes = set(existing["row_hash"].dropna().astype(str).tolist())
+        existing_df = fetch_hash_basis(conn_url, schema_name, min_date=min_date, max_date=max_date)
+        if not existing_df.empty:
+            existing_df["row_hash"] = compute_row_hash_for_df(existing_df)
+            existing_hashes = set(existing_df["row_hash"].dropna().astype(str).tolist())
 
     work = work.loc[~work["row_hash"].isin(existing_hashes)].copy()
     database_duplicates = (before_dedup - internal_duplicates) - len(work)
@@ -1993,13 +2821,21 @@ def write_records_to_postgres(records_df: pd.DataFrame, conn_url: str, schema: s
 
     export_cols = [
         "date",
+        "heure",
+        "numero",
+        "nom",
+        "prenom",
         "province",
         "territoire",
+        "item",
         "details",
+        "details_appel",
         "incident",
+        "type_pathologie",
         "categorie",
         "genre",
         "statut",
+        "resolution",
         "record_count",
         "source_file",
         "sheet_name",
@@ -2143,6 +2979,16 @@ def add_bar_value_labels(fig, orientation: str = "v", is_percent: bool = False, 
 
 
 def add_line_value_labels(fig, is_percent: bool = False) -> None:
+    """Ajoute des valeurs sur les lignes si le nombre de points reste raisonnable."""
+    total_points = 0
+    for trace in fig.data:
+        try:
+            total_points += len(trace.x or [])
+        except Exception:
+            continue
+    if total_points > MAX_LABEL_POINTS:
+        fig.update_traces(mode="lines+markers")
+        return
     template = "%{y:.1f}%" if is_percent else "%{y:,.0f}"
     fig.update_traces(mode="lines+markers+text", texttemplate=template, textposition="top center")
     fig.update_layout(uniformtext_minsize=7, uniformtext_mode="hide")
@@ -2385,6 +3231,17 @@ def compute_kpis(filtered: pd.DataFrame) -> dict[str, float]:
         "female_calls": female_calls,
         "nd_calls": nd_calls,
     }
+
+
+def filter_calls_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Garde uniquement les lignes APPELS (exclut les enregistrements derives des ALERTES)."""
+    if df is None or df.empty:
+        return df
+    if "source_kind" in df.columns:
+        return df[df["source_kind"].astype(str).str.lower().ne("alerts")].copy()
+    if "categorie" in df.columns:
+        return df[~df["categorie"].astype(str).str.contains("alerte", case=False, na=False)].copy()
+    return df.copy()
 
 
 def render_kpi_panel(kpis: dict[str, float]) -> None:
@@ -2799,15 +3656,22 @@ def render_interactive_analytics(
     if "Profil des appels" in options:
         row = st.columns(2)
         with row[0]:
-            top_incidents = (
-                filtered_calls.groupby("incident", as_index=False)["record_count"]
+            scope_col = "territoire" if filtered_calls["province"].nunique() == 1 else "province"
+            scope_label = "Territoire" if scope_col == "territoire" else "Province"
+            top_scopes = (
+                filtered_calls.groupby(scope_col, as_index=False)["record_count"]
                 .sum()
                 .sort_values("record_count", ascending=False)
-                .head(8)
+                .head(5)
             )
-            fig_inc = px.bar(top_incidents, x="incident", y="record_count", labels={"record_count": "Record Count", "incident": "Incident"})
+            fig_inc = px.bar(
+                top_scopes,
+                x=scope_col,
+                y="record_count",
+                labels={"record_count": "Record Count", scope_col: scope_label},
+            )
             add_bar_value_labels(fig_inc, orientation="v")
-            fig_inc.update_layout(title="Top incidents", height=280, margin=dict(l=0, r=0, t=40, b=0))
+            fig_inc.update_layout(title=f"Top 5 {scope_label.lower()}s", height=280, margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fig_inc, use_container_width=True, key="analysis_top_incidents_chart")
         with row[1]:
             filtered_calls = filtered_calls.copy()
@@ -2899,41 +3763,118 @@ def render_general_page(filtered: pd.DataFrame, selected_provinces: list[str]) -
         )
         st.plotly_chart(fig_prov, use_container_width=True)
 
-    st.subheader("Geolocalisation des appels par province")
+
+
+# 1. Définition des couleurs (Ton dictionnaire original)
+    disease_colors = {
+        "MonkeyPox": "#FF6B35",  # Orange vif
+        "Cholera": "#00B4D8",  # Bleu cyan
+        "Ebola/MVE": "#E63946",  # Rouge sang
+        "Rougeole": "#F4D35E",  # Jaune dore
+        "Paludisme": "#06D6A0",  # Vert emeraude
+        "COVID-19": "#9B5DE5",  # Violet
+        "Méningite": "#F77F00",  # Orange brule
+        "Fièvre Typhoïde": "#2EC4B6",  # Teal
+        "Autre": "#ADB5BD",  # Gris neutre
+    }
+    pathology_display_map = {
+        "Mpox": "MonkeyPox",
+        "MonkeyPox": "MonkeyPox",
+        "Cholera": "Cholera",
+        "Ebola/MVE": "Ebola/MVE",
+        "Ebola": "Ebola/MVE",
+        "Rougeole": "Rougeole",
+        "Paludisme": "Paludisme",
+        "COVID-19": "COVID-19",
+        "Covid-19": "COVID-19",
+        "Méningite": "Méningite",
+        "Fièvre Typhoïde": "Fièvre Typhoïde",
+    }
+
+    # 2. Top 5 pathologies par province (affichage multi-points par province)
+    summary_map = (
+        filtered.groupby(["province", "incident"], as_index=False)["record_count"]
+        .sum()
+        .sort_values(["province", "record_count"], ascending=[True, False])
+    )
+    top5_by_prov = summary_map.groupby("province", as_index=False).head(5).copy()
+    top5_by_prov["rank"] = top5_by_prov.groupby("province").cumcount() + 1
+
     map_rows = []
-    for _, row in by_province.iterrows():
-        province = row["province"]
-        if province in PROVINCE_COORDS:
-            lat, lon = PROVINCE_COORDS[province]
-            map_rows.append({"province": province, "lat": lat, "lon": lon, "calls": row["record_count"]})
+    for _, row in top5_by_prov.iterrows():
+        prov = row["province"]
+        disease = canonical_pathology_name(row["incident"])
+        disease = pathology_display_map.get(disease, disease)
+        if disease not in disease_colors:
+            disease = "Autre"
+        if prov in PROVINCE_COORDS:
+            lat, lon = PROVINCE_COORDS[prov]
+            rank = int(row["rank"])
+            angle = (2 * np.pi / 5) * (rank - 1)
+            offset = 0.25
+            lat = lat + (offset * np.cos(angle))
+            lon = lon + (offset * np.sin(angle))
+            map_rows.append(
+                {
+                    "province": prov,
+                    "lat": lat,
+                    "lon": lon,
+                    "calls": row["record_count"],
+                    "disease": disease,
+                    "rank": rank,
+                }
+            )
 
     if map_rows:
         map_df = pd.DataFrame(map_rows)
+        
+        # 3. Création de la carte avec tes paramètres Mapbox
         fig_map = px.scatter_mapbox(
             map_df,
             lat="lat",
             lon="lon",
             size="calls",
-            color="calls",
+            color="disease", # Utilise la colonne des maladies pour la couleur
+            color_discrete_map=disease_colors, # Applique ton dictionnaire de couleurs
             hover_name="province",
-            hover_data={"calls": True, "lat": False, "lon": False},
-            color_continuous_scale="Tealgrn",
+            hover_data={"calls": True, "disease": True, "rank": True, "lat": False, "lon": False},
             size_max=48,
             zoom=4.55,
             center={"lat": -3.5, "lon": 23.6},
             mapbox_style="carto-darkmatter",
         )
-        fig_map.update_traces(text=map_df["calls"].map(format_int), mode="markers+text", textposition="top center")
+
+        # 4. Paramètres d'affichage (Texte et Layout selon ton autre script)
+        fig_map.update_traces(
+            text=map_df["calls"].apply(lambda x: f"{int(x)}"), 
+            mode="markers+text", 
+            textposition="top center"
+        )
+
         fig_map.update_layout(
-            title="Geolocalisation des appels par province",
+            title="<b>Top 5 pathologies par province</b>",
             margin=dict(l=0, r=0, t=40, b=0),
             height=560,
             coloraxis_showscale=False,
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+                font=dict(color="white"),
+                bgcolor="rgba(0,0,0,0.5)"
+            ),
             mapbox=dict(pitch=0, bearing=0),
         )
         st.plotly_chart(fig_map, use_container_width=True)
     else:
-        st.info("Ajoutez des noms de province reconnus pour afficher la carte.")
+        st.info("Aucune donnée disponible pour l'affichage de la carte.")
+
+
+
+
 
     st.subheader("Evolution du nombre d'appels au fil du temps")
     if selected_single_province:
@@ -3014,25 +3955,39 @@ def render_details_page(filtered: pd.DataFrame, selected_provinces: list[str]) -
         st.plotly_chart(fig_gender, use_container_width=True, key="details_gender_chart")
 
     with top_row[1]:
-        st.subheader("Top incidents/pathologies")
-        by_incident = (
-            data.groupby("incident", as_index=False)["record_count"]
-            .sum()
-            .sort_values("record_count", ascending=True)
-            .tail(12)
-        )
+        if selected_single_province:
+            st.subheader(f"Top 5 territoires ({selected_single_province})")
+            by_scope = (
+                data.groupby("territoire", as_index=False)["record_count"]
+                .sum()
+                .sort_values("record_count", ascending=True)
+                .tail(5)
+            )
+            y_col = "territoire"
+            y_label = "Territoire"
+        else:
+            st.subheader("Top 5 incidents/pathologies")
+            by_scope = (
+                data.groupby("incident", as_index=False)["record_count"]
+                .sum()
+                .sort_values("record_count", ascending=True)
+                .tail(5)
+            )
+            y_col = "incident"
+            y_label = "Incident/Pathologie"
+
         fig_incident = px.bar(
-            by_incident,
+            by_scope,
             x="record_count",
-            y="incident",
+            y=y_col,
             orientation="h",
-            labels={"record_count": "Record Count", "incident": "Incident/Pathologie"},
+            labels={"record_count": "Record Count", y_col: y_label},
             color="record_count",
             color_continuous_scale="Blues",
         )
         add_bar_value_labels(fig_incident, orientation="h")
         fig_incident.update_layout(
-            title="Top incidents/pathologies",
+            title=f"Top 5 {y_label.lower()}" + (f" ({selected_single_province})" if selected_single_province else ""),
             margin=dict(l=0, r=0, t=40, b=0),
             coloraxis_showscale=False,
             height=310,
@@ -3557,14 +4512,16 @@ def render_alerts_page(
                 ["Province", "Pathologie", "Details de l'appel"]
             )
     else:
+        details_col = "details_appel" if "details_appel" in calls_alert_scope.columns else "details"
+        resolution_col = "resolution" if "resolution" in calls_alert_scope.columns else "statut"
         calls_alert_scope = calls_alert_scope.sort_values(["province", "territoire", "incident", "date"]).copy()
         if selected_single_province:
             table = calls_alert_scope.rename(
                 columns={
                     "territoire": "Territoire",
                     "incident": "Pathologie",
-                    "details": "Details de l'appel",
-                    "statut": "Resolution",
+                    details_col: "Details de l'appel",
+                    resolution_col: "Resolution",
                 }
             )[["Territoire", "Pathologie", "Details de l'appel", "Resolution"]]
         else:
@@ -3572,8 +4529,8 @@ def render_alerts_page(
                 columns={
                     "province": "Province",
                     "incident": "Pathologie",
-                    "details": "Details de l'appel",
-                    "statut": "Resolution",
+                    details_col: "Details de l'appel",
+                    resolution_col: "Resolution",
                 }
             )[["Province", "Pathologie", "Details de l'appel", "Resolution"]]
 
@@ -3581,7 +4538,15 @@ def render_alerts_page(
     # affichent exactement la meme valeur.
     table = normalize_call_details_text(table, path_col="Pathologie", details_col="Details de l'appel")
     table = table.fillna("Non renseigne").reset_index(drop=True)
-    st.dataframe(table.head(800), use_container_width=True, height=360, hide_index=True)
+
+    show_all_details = st.checkbox(
+        "Afficher toutes les lignes du tableau detaille (peut ralentir)",
+        value=False,
+        key="alerts_detail_show_all",
+    )
+    table_view = table if show_all_details else table.head(MAX_TABLE_ROWS)
+    st.caption(f"{format_int(len(table))} ligne(s) | Affichage: {format_int(len(table_view))}")
+    st.dataframe(table_view, use_container_width=True, height=360, hide_index=True)
 
     # Synthese graphique du tableau detaille: zones (province/territoire) par pathologie.
     if calls_alert_scope.empty:
@@ -3666,25 +4631,110 @@ def render_alerts_page(
         fig_detail.update_xaxes(tickangle=-18)
         st.plotly_chart(fig_detail, use_container_width=True, key="alerts_details_synthesis_chart")
 
+    # Tableau complet fusionne (appels + alertes) avec les colonnes demandees.
+    st.subheader("Tableau complet fusionne (appels + alertes)")
+    calls_full = calls_scope_filtered.copy()
+    alerts_full = alerts_scope.copy()
+
+    if not calls_full.empty:
+        calls_full = calls_full.assign(
+            date=pd.to_datetime(calls_full["date"], errors="coerce"),
+            heure=calls_full.get("heure", pd.to_datetime(calls_full["date"], errors="coerce").dt.strftime("%H:%M:%S")),
+            numero_appelant=calls_full.get("numero", ""),
+            province=calls_full.get("province", ""),
+            territoire=calls_full.get("territoire", ""),
+            genre=calls_full.get("genre", ""),
+            categorie=calls_full.get("categorie", ""),
+            type_pathologie=calls_full.get("incident", ""),
+            item=calls_full.get("item", ""),
+            details_appel=calls_full.get("details_appel", calls_full.get("details", "")),
+            resolution=calls_full.get("resolution", calls_full.get("statut", "")),
+        )
+    if not alerts_full.empty:
+        alerts_full = alerts_full.assign(
+            date=pd.to_datetime(alerts_full["date"], errors="coerce"),
+            heure=pd.to_datetime(alerts_full["date"], errors="coerce").dt.strftime("%H:%M:%S"),
+            numero_appelant="",
+            province=alerts_full.get("province_scope", ""),
+            territoire=alerts_full.get("territoire_norm", ""),
+            genre="ND",
+            categorie="Alerte",
+            type_pathologie=alerts_full.get("indicator", ""),
+            item="",
+            details_appel=alerts_full.get("details", ""),
+            resolution="",
+        )
+
+    merged_full = pd.concat([calls_full, alerts_full], ignore_index=True)
+    columns_order = [
+        "date",
+        "heure",
+        "numero_appelant",
+        "province",
+        "territoire",
+        "genre",
+        "categorie",
+        "type_pathologie",
+        "item",
+        "details_appel",
+        "resolution",
+    ]
+    display_labels = {
+        "date": "Date",
+        "heure": "Heure",
+        "numero_appelant": "Numero appelant",
+        "province": "Province",
+        "territoire": "Territoire",
+        "genre": "Genre",
+        "categorie": "Categorie",
+        "type_pathologie": "Type/Pathologie",
+        "item": "Item",
+        "details_appel": "Detail de l'appel",
+        "resolution": "Resolution",
+    }
+    merged_view = merged_full.reindex(columns=columns_order)
+    merged_view = merged_view.rename(columns=display_labels)
+    if merged_view.empty:
+        st.info("Aucune donnee disponible pour le tableau complet.")
+    else:
+        show_all = st.checkbox(
+            "Afficher toutes les lignes (peut ralentir)",
+            value=False,
+            key="full_table_show_all",
+        )
+        view_df = merged_view if show_all else merged_view.head(MAX_TABLE_ROWS)
+        st.caption(f"{format_int(len(merged_view))} ligne(s) | Affichage: {format_int(len(view_df))}")
+        st.dataframe(
+            view_df,
+            use_container_width=True,
+            height=420,
+        )
+
 
 def default_postgres_config() -> PostgresConfig:
-    # Priorite: champs auth saisis en sidebar (si presents), sinon secrets/env.
-    auth_host = str(st.session_state.get("auth_pg_host", "")).strip()
-    auth_port = str(st.session_state.get("auth_pg_port", "")).strip()
-    auth_database = str(st.session_state.get("auth_pg_database", "")).strip()
-    auth_user = str(st.session_state.get("auth_pg_user", "")).strip()
-    auth_password = str(st.session_state.get("auth_pg_password", ""))
-    auth_schema = str(st.session_state.get("auth_pg_schema", "")).strip()
-    auth_sslmode = str(st.session_state.get("auth_pg_sslmode", "")).strip()
-
+    local_cfg = load_local_pg_config()
+    cached_cfg = st.session_state.get("pg_config_cached")
+    cached: dict[str, str] = {}
+    if isinstance(cached_cfg, PostgresConfig):
+        cached = {
+            "host": cached_cfg.host,
+            "port": cached_cfg.port,
+            "database": cached_cfg.database,
+            "user": cached_cfg.user,
+            "password": cached_cfg.password,
+            "schema": cached_cfg.schema,
+            "sslmode": cached_cfg.sslmode,
+        }
+    elif isinstance(cached_cfg, dict):
+        cached = cached_cfg
     return PostgresConfig(
-        host=auth_host or get_secret_or_env("PGHOST", DEFAULT_DB_HOST),
-        port=auth_port or get_secret_or_env("PGPORT", DEFAULT_DB_PORT),
-        database=auth_database or get_secret_or_env("PGDATABASE", DEFAULT_DB_NAME),
-        user=auth_user or get_secret_or_env("PGUSER", DEFAULT_DB_USER),
-        password=auth_password or get_secret_or_env("PGPASSWORD", ""),
-        schema=auth_schema or get_secret_or_env("PGSCHEMA", DEFAULT_DB_SCHEMA),
-        sslmode=auth_sslmode or get_secret_or_env("PGSSLMODE", "prefer"),
+        host=cached.get("host") or local_cfg.get("host") or get_secret_or_env("PGHOST", DEFAULT_DB_HOST),
+        port=cached.get("port") or local_cfg.get("port") or get_secret_or_env("PGPORT", DEFAULT_DB_PORT),
+        database=cached.get("database") or local_cfg.get("database") or get_secret_or_env("PGDATABASE", DEFAULT_DB_NAME),
+        user=cached.get("user") or local_cfg.get("user") or get_secret_or_env("PGUSER", DEFAULT_DB_USER),
+        password=cached.get("password") or local_cfg.get("password") or get_secret_or_env("PGPASSWORD", ""),
+        schema=cached.get("schema") or local_cfg.get("schema") or get_secret_or_env("PGSCHEMA", DEFAULT_DB_SCHEMA),
+        sslmode=cached.get("sslmode") or local_cfg.get("sslmode") or get_secret_or_env("PGSSLMODE", "prefer"),
     )
 
 
@@ -3697,8 +4747,8 @@ def render_postgres_sidebar(
     upload_files: list[object] | None = None
     write_mode = "append"
 
-    with st.sidebar.expander("Connexion PostgreSQL", expanded=is_admin):
-        if is_admin:
+    if is_admin:
+        with st.sidebar.expander("Connexion PostgreSQL", expanded=True):
             st.caption("Renseignez la base PostgreSQL utilisee comme source de donnees du dashboard.")
             host = st.text_input("Host", value=cfg.host, key="pg_host")
             port = st.text_input("Port", value=cfg.port, key="pg_port")
@@ -3724,6 +4774,21 @@ def render_postgres_sidebar(
                 schema=sanitize_identifier(schema.strip() or DEFAULT_DB_SCHEMA, DEFAULT_DB_SCHEMA),
                 sslmode=sslmode,
             )
+            st.session_state["pg_config_cached"] = {
+                "host": config.host,
+                "port": config.port,
+                "database": config.database,
+                "user": config.user,
+                "password": config.password,
+                "schema": config.schema,
+                "sslmode": config.sslmode,
+            }
+            if st.button("Enregistrer dans pg_config.local.json", key="pg_save_local"):
+                ok, msg = save_local_pg_config(config)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
 
             if st.button("Tester la connexion", key="pg_test_connection"):
                 try:
@@ -3737,13 +4802,8 @@ def render_postgres_sidebar(
                     st.success(f"Connexion OK. Schema actif: {schema_name}")
                 except Exception as exc:
                     st.error(f"Echec connexion PostgreSQL: {exc}")
-        else:
-            config = cfg
-            st.caption("Profil utilisateur: connexion en lecture seule (configuration reservee a l'administrateur).")
-            st.text(f"Host: {cfg.host}")
-            st.text(f"Port: {cfg.port}")
-            st.text(f"Base: {cfg.database}")
-            st.text(f"Schema: {cfg.schema}")
+    else:
+        config = cfg
 
     if is_admin:
         with st.sidebar.expander("Importer Excel vers PostgreSQL", expanded=False):
@@ -3767,6 +4827,32 @@ def render_postgres_sidebar(
                 accept_multiple_files=True,
                 disabled=not allow_import,
             )
+            upload_sig = build_upload_signature(upload_files)
+            cached_sig = st.session_state.get("pg_cleaned_sig", "")
+            if upload_sig != cached_sig:
+                st.session_state.pop("pg_cleaned_bundle", None)
+                st.session_state.pop("pg_cleaned_report", None)
+                st.session_state["pg_cleaned_sig"] = upload_sig
+
+            if allow_import and upload_files:
+                if st.button("Preparer Excel nettoye", key="pg_prepare_clean"):
+                    with st.spinner("Preparation du fichier nettoye..."):
+                        cleaned_bytes, cleaned_report = build_cleaned_excel_bundle(upload_files)
+                    st.session_state["pg_cleaned_bundle"] = cleaned_bytes
+                    st.session_state["pg_cleaned_report"] = cleaned_report
+
+                cleaned_bytes = st.session_state.get("pg_cleaned_bundle")
+                cleaned_report = st.session_state.get("pg_cleaned_report")
+                if cleaned_bytes:
+                    st.download_button(
+                        "Telecharger Excel nettoye (avant import)",
+                        data=cleaned_bytes,
+                        file_name="call_center_nettoye.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    if isinstance(cleaned_report, pd.DataFrame) and not cleaned_report.empty:
+                        st.caption("Rapport de nettoyage (avant import)")
+                        st.dataframe(cleaned_report, use_container_width=True, height=200)
             if st.button("Importer vers PostgreSQL", key="pg_import_button", disabled=not allow_import):
                 try:
                     ok, db_message = ensure_postgres_database(config)
@@ -3812,6 +4898,22 @@ def render_postgres_sidebar(
                         "message": "Message",
                     }
                 )
+                if "Statut" in report_view.columns:
+                    def _dup_reason(row: pd.Series) -> str:
+                        if row.get("Statut") == "duplicate_file":
+                            return "meme fichier"
+                        if pd.to_numeric(row.get("Doublons", 0), errors="coerce") > 0:
+                            return "meme hash"
+                        return ""
+
+                    report_view["Raison doublon"] = report_view.apply(_dup_reason, axis=1)
+                # Notifications doublons
+                dup_files = int((report_view["Statut"] == "duplicate_file").sum()) if "Statut" in report_view.columns else 0
+                dup_rows = int(pd.to_numeric(report_view.get("Doublons", 0), errors="coerce").fillna(0).sum())
+                if dup_files:
+                    st.warning(f"{dup_files} fichier(s) ignores (doublon detecte).")
+                if dup_rows:
+                    st.warning(f"{format_int(dup_rows)} ligne(s) doublon(s) detectee(s) a l'import.")
                 st.dataframe(
                     report_view[
                         [
@@ -3823,6 +4925,7 @@ def render_postgres_sidebar(
                             "Lignes lues",
                             "Lignes inserees",
                             "Doublons",
+                            "Raison doublon",
                             "Colonnes manquantes",
                             "Lignes incompletes",
                             "Statut",
@@ -3832,6 +4935,64 @@ def render_postgres_sidebar(
                     use_container_width=True,
                     height=280,
                 )
+        with st.sidebar.expander("Nettoyer les imports", expanded=False):
+            st.caption("Supprime les doublons ou purge toute la table d'import.")
+            if st.button("Supprimer les doublons (row_hash)", key="pg_purge_duplicates"):
+                try:
+                    ok, db_message = ensure_postgres_database(config)
+                    if not ok:
+                        raise RuntimeError(db_message)
+                    conn_url = build_pg_url(config)
+                    dup_report = fetch_duplicate_rows(conn_url, config.schema)
+                    dup_before = int(len(dup_report)) if isinstance(dup_report, pd.DataFrame) else 0
+                    before, after, removed = recompute_and_dedup(conn_url, config.schema)
+                    st.success(
+                        "Nettoyage termine. "
+                        f"Doublons detects: {format_int(dup_before)} | "
+                        f"Lignes supprimees: {format_int(removed)} | "
+                        f"Lignes restantes: {format_int(after)}"
+                    )
+                    if isinstance(dup_report, pd.DataFrame) and not dup_report.empty:
+                        dup_report = dup_report.copy()
+                        dup_report["raison_doublon"] = "meme hash"
+                        st.session_state["pg_last_duplicate_report"] = dup_report
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Echec nettoyage doublons: {exc}")
+
+            confirm_all = st.checkbox("Je confirme la purge complete (table + audit)", key="pg_purge_confirm")
+            if st.button("Purger toutes les imports", key="pg_purge_all", disabled=not confirm_all):
+                try:
+                    ok, db_message = ensure_postgres_database(config)
+                    if not ok:
+                        raise RuntimeError(db_message)
+                    conn_url = build_pg_url(config)
+                    before = count_duplicate_rows(conn_url, config.schema)
+                    purge_all_imports(conn_url, config.schema)
+                    st.success(
+                        "Purge complete terminee. "
+                        f"Doublons detectes avant purge: {format_int(before)}. "
+                        "La table est maintenant vide."
+                    )
+                    st.session_state.pop("pg_last_duplicate_report", None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Echec purge complete: {exc}")
+
+        dup_report = st.session_state.get("pg_last_duplicate_report")
+        if isinstance(dup_report, pd.DataFrame) and not dup_report.empty:
+            st.sidebar.caption("Rapport des doublons supprimes")
+            st.sidebar.dataframe(dup_report, use_container_width=True, height=220)
+            report_bytes = BytesIO()
+            with pd.ExcelWriter(report_bytes, engine="openpyxl") as writer:
+                dup_report.to_excel(writer, sheet_name="Doublons_supprimes", index=False)
+            report_bytes.seek(0)
+            st.sidebar.download_button(
+                "Telecharger le rapport des doublons (Excel)",
+                data=report_bytes.getvalue(),
+                file_name="rapport_doublons_supprimes.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
     else:
         with st.sidebar.expander("Importer Excel vers PostgreSQL", expanded=False):
             st.info("Fonction reservee a l'administrateur.")
@@ -4005,13 +5166,15 @@ def build_dashboard_report_excel(
 
     # Tableau detaille des alertes (export).
     if not calls_alert_scope.empty:
+        details_col = "details_appel" if "details_appel" in calls_alert_scope.columns else "details"
+        resolution_col = "resolution" if "resolution" in calls_alert_scope.columns else "statut"
         if selected_single_province:
             detail_alertes_df = calls_alert_scope.rename(
                 columns={
                     "territoire": "Zone",
                     "incident": "Pathologie",
-                    "details": "Details de l'appel",
-                    "statut": "Resolution",
+                    details_col: "Details de l'appel",
+                    resolution_col: "Resolution",
                     "date": "Date",
                     "record_count": "Record Count",
                 }
@@ -4021,8 +5184,8 @@ def build_dashboard_report_excel(
                 columns={
                     "province": "Zone",
                     "incident": "Pathologie",
-                    "details": "Details de l'appel",
-                    "statut": "Resolution",
+                    details_col: "Details de l'appel",
+                    resolution_col: "Resolution",
                     "date": "Date",
                     "record_count": "Record Count",
                 }
@@ -4063,13 +5226,72 @@ def build_dashboard_report_excel(
         .sort_values("Record Count", ascending=False)
     )
 
+    merged_calls = calls.copy()
+    merged_alerts = alerts_scope.copy()
+    if not merged_calls.empty:
+        merged_calls = merged_calls.assign(
+            date=pd.to_datetime(merged_calls["date"], errors="coerce"),
+            heure=merged_calls.get("heure", pd.to_datetime(merged_calls["date"], errors="coerce").dt.strftime("%H:%M:%S")),
+            numero_appelant=merged_calls.get("numero", ""),
+            province=merged_calls.get("province", ""),
+            territoire=merged_calls.get("territoire", ""),
+            genre=merged_calls.get("genre", ""),
+            categorie=merged_calls.get("categorie", ""),
+            type_pathologie=merged_calls.get("incident", ""),
+            item=merged_calls.get("item", ""),
+            details_appel=merged_calls.get("details_appel", merged_calls.get("details", "")),
+            resolution=merged_calls.get("resolution", merged_calls.get("statut", "")),
+        )
+    if not merged_alerts.empty:
+        merged_alerts = merged_alerts.assign(
+            date=pd.to_datetime(merged_alerts["date"], errors="coerce"),
+            heure=pd.to_datetime(merged_alerts["date"], errors="coerce").dt.strftime("%H:%M:%S"),
+            numero_appelant="",
+            province=merged_alerts.get("province_scope", ""),
+            territoire=merged_alerts.get("territoire_norm", ""),
+            genre="ND",
+            categorie="Alerte",
+            type_pathologie=merged_alerts.get("indicator", ""),
+            item="",
+            details_appel=merged_alerts.get("details", ""),
+            resolution=merged_alerts.get("resolution", ""),
+        )
+    merged_full = pd.concat([merged_calls, merged_alerts], ignore_index=True, sort=False)
+    merged_full = merged_full.reindex(
+        columns=[
+            "date",
+            "heure",
+            "numero_appelant",
+            "province",
+            "territoire",
+            "genre",
+            "categorie",
+            "type_pathologie",
+            "item",
+            "details_appel",
+            "resolution",
+        ]
+    ).rename(
+        columns={
+            "date": "Date",
+            "heure": "Heure",
+            "numero_appelant": "Numero appelant",
+            "province": "Province",
+            "territoire": "Territoire",
+            "genre": "Genre",
+            "categorie": "Categorie",
+            "type_pathologie": "Type/Pathologie",
+            "item": "Item",
+            "details_appel": "Detail de l'appel",
+            "resolution": "Resolution",
+        }
+    )
     sheets: list[tuple[str, pd.DataFrame]] = [
         ("Graph_Proportion_Appels", proportion_calls_df),
         ("Graph_Alertes_Localite", alertes_localite_df),
         ("Graph_Alertes_Indicateur", alertes_indicateur_df),
         ("Synthese_Alertes_Patho", synth_alertes_df),
-        ("Appels_Filtres", calls),
-        ("Alertes_Filtres", alerts_scope),
+        ("Tableau_Complet_Fusionne", merged_full),
     ]
 
     output = BytesIO()
@@ -4146,7 +5368,8 @@ def main() -> None:
         )
     else:
         source_mode = "PostgreSQL"
-        st.sidebar.info("Utilisateur: mode lecture seule (visualisation + export).")
+    if not is_admin:
+        st.sidebar.info("Utilisateur: lecture seule (visualisation + export). Import PostgreSQL reserve a l'administrateur.")
 
     if is_admin and source_mode != "PostgreSQL":
         render_dashboard_users_admin(cfg=default_postgres_config(), current_user=auth_user)
@@ -4161,7 +5384,15 @@ def main() -> None:
         conn_url = build_pg_url(pg_config)
         db_label = f"PostgreSQL {pg_config.host}:{pg_config.port}/{pg_config.database}"
         try:
-            ok, db_message = ensure_postgres_database(pg_config)
+            ok, db_message = check_postgres_connection_cached(
+                pg_config.host,
+                pg_config.port,
+                pg_config.database,
+                pg_config.user,
+                pg_config.password,
+                pg_config.schema,
+                pg_config.sslmode,
+            )
             if not ok:
                 raise RuntimeError(db_message)
             if db_message:
@@ -4186,8 +5417,13 @@ def main() -> None:
             )
         calls_df, calls_info, alerts_df, alerts_info = load_unified_data(upload_files)
 
+    calls_base = filter_calls_only(calls_df)
+    if calls_base is None or calls_base.empty:
+        calls_base = calls_df
+
     render_header()
-    render_source_notes(calls_info, alerts_info)
+    if is_admin:
+        render_source_notes(calls_info, alerts_info)
 
     if source_mode == "Upload Excel direct":
         has_upload = bool(st.session_state.get("upload_files"))
@@ -4199,18 +5435,18 @@ def main() -> None:
         st.info("Aucune donnee disponible. Importez vos fichiers Excel vers PostgreSQL, puis rechargez la page.")
         st.stop()
 
-    if calls_df.empty and page != "Details alertes":
+    if calls_base.empty and page != "Details alertes":
         st.warning("La source APPELS est vide. Importez des appels pour afficher cette section.")
         st.stop()
 
-    if calls_df.empty and page == "Details alertes":
+    if calls_base.empty and page == "Details alertes":
         render_alerts_page(alerts_df, [], empty_calls_dataframe())
         st.stop()
 
     kpi_placeholder = st.empty()
 
-    min_date = pd.to_datetime(calls_df["date"], errors="coerce").min()
-    max_date = pd.to_datetime(calls_df["date"], errors="coerce").max()
+    min_date = pd.to_datetime(calls_base["date"], errors="coerce").min()
+    max_date = pd.to_datetime(calls_base["date"], errors="coerce").max()
     if pd.isna(min_date) or pd.isna(max_date):
         min_date = pd.Timestamp.today().normalize()
         max_date = min_date
@@ -4219,10 +5455,10 @@ def main() -> None:
         st.markdown("<div class='filter-title'>Zone de filtres principaux</div>", unsafe_allow_html=True)
         # Bloc 1: filtres metier reactifs (province -> genre -> incident -> categorie).
         business_cols = st.columns(4, gap="small")
-        province_options = sorted(calls_df["province"].dropna().astype(str).unique().tolist())
+        province_options = sorted(calls_base["province"].dropna().astype(str).unique().tolist())
         selected_provinces = business_cols[0].multiselect("Province", province_options, default=province_options)
 
-        genre_scope = calls_df.copy()
+        genre_scope = calls_base.copy()
         if selected_provinces:
             genre_scope = genre_scope[genre_scope["province"].isin(selected_provinces)]
         genre_options = sorted(genre_scope["genre"].dropna().astype(str).unique().tolist())
@@ -4307,7 +5543,7 @@ def main() -> None:
         end_ts = pd.Timestamp(date_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 
     filtered_calls = apply_calls_filters(
-        calls_df,
+        calls_base,
         start_ts,
         end_ts,
         selected_provinces,
@@ -4329,7 +5565,7 @@ def main() -> None:
     prev_start = prev_end - pd.Timedelta(days=window_days) + pd.Timedelta(seconds=1)
 
     previous_calls = apply_calls_filters(
-        calls_df,
+        calls_base,
         prev_start,
         prev_end,
         selected_provinces,

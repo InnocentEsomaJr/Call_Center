@@ -95,17 +95,41 @@ setx PGSSLMODE "prefer"
 
 Puis redemarrer le terminal.
 
+## 6.1) Fichier local de connexion (ignore par git)
+
+Vous pouvez aussi creer un fichier local `pg_config.local.json` (non versionne).
+
+Exemple (modele disponible dans `pg_config.local.example.json`):
+
+```json
+{
+  "host": "localhost",
+  "port": "5432",
+  "database": "call_center",
+  "user": "postgres",
+  "password": "VOTRE_MOT_DE_PASSE",
+  "schema": "public",
+  "sslmode": "prefer"
+}
+```
+
 ## 7) Structure SQL utilisee
 
 ### Table `call_center_records`
 - `date` (timestamp)
+- `heure` (text)
+- `numero` (text)
 - `province` (text)
 - `territoire` (text)
+- `item` (text)
 - `details` (text)
+- `details_appel` (text)
 - `incident` (text)
+- `type_pathologie` (text)
 - `categorie` (text)
 - `genre` (text)
 - `statut` (text)
+- `resolution` (text)
 - `record_count` (double precision)
 - `source_file` (text)
 - `sheet_name` (text)
